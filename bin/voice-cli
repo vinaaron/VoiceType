@@ -23,7 +23,10 @@ from record import record_with_silence_detection, record_fixed_duration
 from vad_record import record_with_vad
 from transcribe import Transcriber
 from number_words import convert_number_words
-from output import type_text, type_text_via_clipboard, play_sound, notify, get_frontmost_app, press_enter
+from output import (
+    type_text, type_text_via_clipboard, play_sound, notify,
+    get_frontmost_app, press_enter, show_recording_indicator, hide_recording_indicator
+)
 
 # Lock file to prevent concurrent recordings
 LOCK_FILE = os.path.expanduser("~/.voice-cli/voice-cli.lock")
@@ -90,12 +93,15 @@ def load_config():
     json_path = os.path.join(config_dir, "config.json")
 
     defaults = {
-        "model": "base.en",
+        "model": "distil-medium.en",  # MLX model (distil-small.en, distil-medium.en, distil-large-v3)
+        "transcription_mode": "mlx",  # "mlx" (fast local), "groq" (cloud), "local" (slower fallback)
+        "groq_api_key": None,  # Required for groq mode (or set GROQ_API_KEY env var)
         "silence_duration": 3.0,  # Seconds of silence before stopping (allows thinking pauses)
         "silence_threshold": "1%",  # Fallback for sox (background <1%, speech ~4%)
         "sound_feedback": True,
         "convert_numbers": True,
         "show_notifications": True,  # Visual feedback via macOS notifications
+        "show_recording_indicator": True,  # Show visual indicator during recording
         "vad_mode": True,  # Use Silero VAD for intelligent speech detection (recommended)
         "vad_threshold": 0.5,  # VAD confidence threshold (0-1)
         "max_duration": 300,  # Safety cap (5 min) - rarely hit, silence detection stops recording
@@ -146,8 +152,13 @@ def main():
     parser.add_argument(
         "--model",
         default=None,
-        choices=["tiny.en", "base.en", "small.en", "medium.en", "large-v3"],
-        help="Whisper model to use (default: from config or base.en)"
+        help="Whisper model to use (default: distil-medium.en for MLX)"
+    )
+    parser.add_argument(
+        "--mode",
+        default=None,
+        choices=["mlx", "groq", "local"],
+        help="Transcription mode: mlx (fast local), groq (cloud), local (slower fallback)"
     )
     parser.add_argument(
         "--duration",
@@ -194,11 +205,14 @@ def main():
     config = load_config()
 
     model = args.model or config["model"]
+    transcription_mode = args.mode or config.get("transcription_mode", "mlx")
+    groq_api_key = config.get("groq_api_key") or os.environ.get("GROQ_API_KEY")
     duration = args.duration or config.get("duration", 5.0)
     silence_duration = args.silence or config["silence_duration"]
     use_sound = not args.no_sound and config["sound_feedback"]
     convert_nums = not args.no_numbers and config["convert_numbers"]
     show_notify = not args.no_notify and config.get("show_notifications", True)
+    show_indicator = config.get("show_recording_indicator", True)
     use_vad = not args.no_vad and config.get("vad_mode", True)
     vad_threshold = args.vad_threshold or config.get("vad_threshold", 0.5)
     max_duration = config.get("max_duration", 30)
@@ -242,21 +256,31 @@ def main():
         if use_sound:
             play_sound("Ping")
 
+        # Show visual recording indicator
+        indicator = None
+        if show_indicator:
+            indicator = show_recording_indicator()
+
         # Record audio - VAD by default (auto-stops when you stop speaking)
-        if use_vad:
-            try:
-                audio_path = record_with_vad(
-                    silence_duration=silence_duration,
-                    max_duration=max_duration,
-                    speech_threshold=vad_threshold
-                )
-            except Exception as e:
-                # Fallback to fixed duration if VAD fails
-                if args.debug:
-                    print(f"VAD failed, using fixed duration: {e}")
+        try:
+            if use_vad:
+                try:
+                    audio_path = record_with_vad(
+                        silence_duration=silence_duration,
+                        max_duration=max_duration,
+                        speech_threshold=vad_threshold
+                    )
+                except Exception as e:
+                    # Fallback to fixed duration if VAD fails
+                    if args.debug:
+                        print(f"VAD failed, using fixed duration: {e}")
+                    audio_path = record_fixed_duration(duration=duration)
+            else:
                 audio_path = record_fixed_duration(duration=duration)
-        else:
-            audio_path = record_fixed_duration(duration=duration)
+        finally:
+            # Hide indicator when recording stops
+            if indicator:
+                hide_recording_indicator(indicator)
 
         # Audio feedback: recording stopped, processing
         if use_sound:
@@ -281,10 +305,47 @@ def main():
 
         # Visual feedback: transcribing
         if show_notify:
-            notify("Voice CLI", "Transcribing...")
+            mode_name = {"mlx": "MLX", "groq": "Groq", "local": "Local"}
+            notify("Voice CLI", f"Transcribing ({mode_name.get(transcription_mode, transcription_mode)})...")
 
-        # Transcribe
-        text = Transcriber.transcribe(audio_path, model_name=model)
+        # Transcribe using selected mode
+        if args.debug:
+            print(f"Transcription mode: {transcription_mode}")
+
+        if transcription_mode == "mlx":
+            # Fast local transcription using Lightning Whisper MLX (Apple Silicon)
+            try:
+                from mlx_transcribe import transcribe_with_mlx
+                text = transcribe_with_mlx(audio_path, model_name=model)
+            except ImportError:
+                if args.debug:
+                    print("MLX not available, falling back to local")
+                text = Transcriber.transcribe(audio_path, model_name=model)
+            except Exception as e:
+                if args.debug:
+                    print(f"MLX failed: {e}, falling back to local")
+                text = Transcriber.transcribe(audio_path, model_name=model)
+
+        elif transcription_mode == "groq":
+            # Cloud transcription using Groq API (fastest, requires API key)
+            if not groq_api_key:
+                if show_notify:
+                    notify("Voice CLI Error", "Groq API key required. Set GROQ_API_KEY or use --mode mlx")
+                if args.debug:
+                    print("Groq API key not set")
+                os.remove(audio_path)
+                return
+            try:
+                from groq_transcribe import transcribe_with_groq
+                text = transcribe_with_groq(audio_path, api_key=groq_api_key)
+            except Exception as e:
+                if args.debug:
+                    print(f"Groq failed: {e}, falling back to local")
+                text = Transcriber.transcribe(audio_path, model_name=model)
+
+        else:
+            # Local fallback using faster-whisper (slower but reliable)
+            text = Transcriber.transcribe(audio_path, model_name=model)
 
         if not text:
             if show_notify:
@@ -305,6 +366,7 @@ def main():
 
         if args.debug:
             print(f"Transcribed: {text}")
+            print(f"Mode: {transcription_mode}")
             print(f"Model: {model}")
             print(f"Audio size: {file_size} bytes")
             print(f"Target app: {original_app}")

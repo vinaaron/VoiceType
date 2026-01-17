@@ -1,7 +1,13 @@
 # Voice CLI Dependencies
 
-# Transcription (brings its own dependencies)
+# Fast local transcription for Apple Silicon (10x faster than Whisper CPP)
+lightning-whisper-mlx>=0.4.0
+
+# Fallback transcription (CPU-based, works on all platforms)
 faster-whisper>=1.0.0
+
+# Optional: Cloud transcription (299x real-time speed)
+groq>=0.11.0
 
 # Voice Activity Detection (intelligent silence detection)
 silero-vad>=5.0
