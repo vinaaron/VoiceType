@@ -99,47 +99,6 @@ def press_enter() -> None:
     )
 
 
-def show_recording_indicator() -> subprocess.Popen:
-    """
-    Show a floating recording indicator window.
-
-    Returns:
-        Popen process that can be terminated to close the indicator
-    """
-    # Create a minimal floating window using osascript
-    # This shows a small dialog that auto-dismisses
-    script = '''
-    tell application "System Events"
-        display dialog "Recording..." buttons {"Cancel"} ¬
-            giving up after 300 ¬
-            with title "Voice CLI" ¬
-            with icon note
-    end tell
-    '''
-
-    # Run in background so we can kill it later
-    return subprocess.Popen(
-        ["osascript", "-e", script],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-
-
-def hide_recording_indicator(indicator_process: subprocess.Popen) -> None:
-    """
-    Hide the recording indicator by terminating its process.
-
-    Args:
-        indicator_process: The Popen process from show_recording_indicator()
-    """
-    if indicator_process:
-        indicator_process.terminate()
-        try:
-            indicator_process.wait(timeout=0.5)
-        except subprocess.TimeoutExpired:
-            indicator_process.kill()
-
-
 def type_text_via_clipboard(text: str, target_app: str = None) -> None:
     """
     Type text into an application using the clipboard method.

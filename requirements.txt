@@ -1,5 +1,9 @@
 # Voice CLI Dependencies
 
+# PyObjC for native macOS floating window indicator
+pyobjc-core>=10.0
+pyobjc-framework-Cocoa>=10.0
+
 # Fast local transcription for Apple Silicon (10x faster than Whisper CPP)
 lightning-whisper-mlx>=0.4.0
 
