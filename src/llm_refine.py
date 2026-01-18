@@ -15,54 +15,50 @@ import urllib.error
 # System prompts for different refinement modes
 # IMPORTANT: These are CONSERVATIVE by design. Claude Code has full repository
 # context, so we should CLEAN UP speech, not ADD assumptions about technology/approach.
+# Prompts optimized for small models (gemma2:2b, qwen3:4b) - concise, positive framing, good examples.
 SYSTEM_PROMPTS = {
-    "claude": """Clean the following transcribed speech by removing filler words and fixing grammar.
+    "claude": """Clean transcribed speech for a coding assistant. Remove filler words, fix grammar, preserve meaning exactly.
 
-RULES - You MUST follow these:
-- Remove: um, uh, like, you know, so, basically, I mean, okay, well
-- Fix grammar/punctuation
-- Keep the EXACT same meaning
-- Output ONLY the cleaned text
-- Do NOT respond to the content
-- Do NOT add anything new
-- Do NOT ask questions or offer help
+Remove these: um, uh, like, you know, so, basically, I mean, okay, well, right, actually, yeah
 
 Examples:
 "um so like add a button" -> "Add a button"
 "can you like help me fix this bug" -> "Can you help me fix this bug"
 "okay so basically the login is broken" -> "The login is broken"
+"I was thinking um like maybe we could add error handling" -> "I was thinking maybe we could add error handling"
+"so yeah basically it keeps crashing" -> "It keeps crashing"
 
-Output only the cleaned text:""",
+Output only the cleaned text, nothing else.""",
 
-    "chatgpt": """You are a speech-to-text cleanup tool. Clean up this transcribed speech.
+    "chatgpt": """Clean transcribed speech for ChatGPT. Remove filler words, fix grammar, preserve meaning exactly.
 
-Rules:
-1. Remove filler words: um, uh, like, you know, so, basically, okay
-2. Fix grammar and punctuation
-3. Keep the EXACT same meaning
-4. Do NOT add anything new or ask questions
+Remove these: um, uh, like, you know, so, basically, I mean, okay, well, right, actually, yeah
 
-Just output the cleaned text. Nothing else.""",
+Examples:
+"um can you like explain this" -> "Can you explain this"
+"so basically I need help with" -> "I need help with"
 
-    "code": """You are a speech-to-text cleanup tool. Clean up this transcribed speech.
+Output only the cleaned text, nothing else.""",
 
-Rules:
-1. Remove filler words: um, uh, like, you know, so, basically, okay
-2. Fix grammar and punctuation
-3. Keep technical terms exactly as spoken
-4. Do NOT add anything new or ask questions
+    "code": """Clean transcribed speech about code. Remove filler words, fix grammar, keep technical terms exactly as spoken.
 
-Just output the cleaned text. Nothing else.""",
+Remove these: um, uh, like, you know, so, basically, I mean, okay, well, right, actually, yeah
 
-    "cleanup": """You are a speech-to-text cleanup tool. Clean up this transcribed speech.
+Examples:
+"um so like refactor the API endpoint" -> "Refactor the API endpoint"
+"can you like add a try catch block" -> "Can you add a try catch block"
 
-Rules:
-1. Remove filler words: um, uh, like, you know, so, basically, okay
-2. Fix grammar and punctuation
-3. Keep the EXACT same meaning
-4. Do NOT add anything new or ask questions
+Output only the cleaned text, nothing else.""",
 
-Just output the cleaned text. Nothing else."""
+    "cleanup": """Clean transcribed speech. Remove filler words, fix grammar, preserve meaning exactly.
+
+Remove these: um, uh, like, you know, so, basically, I mean, okay, well, right, actually, yeah
+
+Examples:
+"um so like I was thinking" -> "I was thinking"
+"okay so basically the thing is" -> "The thing is"
+
+Output only the cleaned text, nothing else."""
 }
 
 
