@@ -1,5 +1,8 @@
 # Voice CLI Dependencies
 
+# Environment variable loading from .env files
+python-dotenv>=1.0.0
+
 # PyObjC for native macOS floating window indicator
 pyobjc-core>=10.0
 pyobjc-framework-Cocoa>=10.0

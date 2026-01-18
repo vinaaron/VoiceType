@@ -19,6 +19,21 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SRC_DIR = os.path.join(os.path.dirname(SCRIPT_DIR), "src")
 sys.path.insert(0, SRC_DIR)
 
+# Load environment variables from .env file (if exists)
+# Checks project root first, then ~/.voice-cli/
+try:
+    from dotenv import load_dotenv
+    env_paths = [
+        os.path.join(os.path.dirname(SCRIPT_DIR), ".env"),  # Project root
+        os.path.expanduser("~/.voice-cli/.env"),            # User config dir
+    ]
+    for env_path in env_paths:
+        if os.path.exists(env_path):
+            load_dotenv(env_path)
+            break
+except ImportError:
+    pass  # python-dotenv not installed, continue without it
+
 from record import record_with_silence_detection, record_fixed_duration
 from vad_record import record_with_vad
 from transcribe import Transcriber
@@ -28,6 +43,7 @@ from output import (
     get_frontmost_app, press_enter
 )
 from recording_indicator import show_recording_indicator, hide_recording_indicator
+from llm_refine import refine_text, check_llm_trigger, DEFAULT_LLM_TRIGGERS
 
 # Lock file to prevent concurrent recordings
 LOCK_FILE = os.path.expanduser("~/.voice-cli/voice-cli.lock")
@@ -109,6 +125,12 @@ def load_config():
         "duration": 5.0,  # Fallback fixed duration
         "auto_enter": True,  # Press Enter when trigger words detected at end
         "enter_triggers": ["enter", "send", "submit", "return"],  # Words that trigger Enter
+        # LLM refinement settings
+        "llm_refinement": True,  # Enable LLM-powered prompt refinement
+        "llm_backend": "groq",  # "groq" or "ollama"
+        "llm_model": "llama-3.3-70b-versatile",  # Model for refinement
+        "ollama_url": "http://localhost:11434",  # Ollama server URL
+        "llm_triggers": None,  # Use DEFAULT_LLM_TRIGGERS if not set
     }
 
     # Try YAML first (preferred for human-readable config with comments)
@@ -199,6 +221,11 @@ def main():
         action="store_true",
         help="Disable auto-enter trigger words (send, enter, etc.)"
     )
+    parser.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="Disable LLM refinement (for claude, for chatgpt triggers)"
+    )
 
     args = parser.parse_args()
 
@@ -219,6 +246,8 @@ def main():
     max_duration = config.get("max_duration", 30)
     auto_enter = not args.no_enter and config.get("auto_enter", True)
     enter_triggers = config.get("enter_triggers", ["enter", "send", "submit", "return"])
+    use_llm = not args.no_llm and config.get("llm_refinement", True)
+    llm_triggers = config.get("llm_triggers") or DEFAULT_LLM_TRIGGERS
 
     # Try to acquire lock (prevent concurrent recordings)
     lock_fd = acquire_lock()
@@ -262,6 +291,11 @@ def main():
         if show_indicator:
             indicator = show_recording_indicator()
 
+        # Create audio level callback for waveform visualization
+        def on_audio_level(level):
+            if indicator:
+                indicator.update_level(level)
+
         # Record audio - VAD by default (auto-stops when you stop speaking)
         try:
             if use_vad:
@@ -269,7 +303,8 @@ def main():
                     audio_path = record_with_vad(
                         silence_duration=silence_duration,
                         max_duration=max_duration,
-                        speech_threshold=vad_threshold
+                        speech_threshold=vad_threshold,
+                        on_audio_level=on_audio_level if show_indicator else None,
                     )
                 except Exception as e:
                     # Fallback to fixed duration if VAD fails
@@ -359,6 +394,20 @@ def main():
         # Convert number words to digits
         if convert_nums:
             text = convert_number_words(text)
+
+        # Check for LLM refinement trigger (e.g., "for claude code")
+        llm_mode = None
+        if use_llm:
+            text, llm_mode = check_llm_trigger(text, llm_triggers)
+            if llm_mode:
+                if args.debug:
+                    print(f"LLM trigger detected: {llm_mode}")
+                    print(f"Original text: {text}")
+                if show_notify:
+                    notify("Voice CLI", f"Refining for {llm_mode}...")
+                text = refine_text(text, llm_mode, config)
+                if args.debug:
+                    print(f"Refined text: {text}")
 
         # Check for enter trigger words (e.g., "send", "enter")
         should_enter = False

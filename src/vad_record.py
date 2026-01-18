@@ -52,6 +52,7 @@ def record_with_vad(
     silence_duration=2.0,
     max_duration=30,
     speech_threshold=0.5,
+    on_audio_level=None,
 ):
     """
     Record audio until user stops speaking.
@@ -65,6 +66,8 @@ def record_with_vad(
         silence_duration: Seconds of silence before stopping (default: 2.0)
         max_duration: Maximum recording time in seconds (default: 30)
         speech_threshold: VAD confidence threshold 0-1 (default: 0.5)
+        on_audio_level: Optional callback(level) for real-time audio visualization.
+                        Level is normalized 0-1 based on RMS.
 
     Returns:
         Path to recorded audio file
@@ -109,13 +112,27 @@ def record_with_vad(
         max_chunks = int(max_duration * 1000 / CHUNK_MS)
         speech_detected = False
 
-        for i in range(max_chunks):
+        for _ in range(max_chunks):
             # Read audio chunk
             data = stream.read(CHUNK_SAMPLES, exception_on_overflow=False)
             frames.append(data)
 
-            # Convert to tensor for VAD
+            # Convert to numpy array for processing
             audio_int16 = np.frombuffer(data, np.int16)
+
+            # Calculate audio level for visualization
+            if on_audio_level:
+                # Calculate RMS using numpy (audioop removed in Python 3.13)
+                rms = np.sqrt(np.mean(audio_int16.astype(np.float32) ** 2))
+                # Normalize to 0-1 (background ~5, soft speech ~50, loud speech ~500)
+                # Use log scale for better visual response
+                if rms > 1:
+                    normalized = min(1.0, (np.log10(rms) + 1) / 3)  # log10(1)=0, log10(1000)=3
+                else:
+                    normalized = 0.0
+                on_audio_level(normalized)
+
+            # Convert to tensor for VAD
             audio_float32 = int2float(audio_int16)
             tensor = torch.from_numpy(audio_float32)
 
