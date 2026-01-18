@@ -247,8 +247,9 @@ def check_llm_trigger(text: str, triggers: list) -> tuple:
 
 
 # Default trigger configuration
+# Includes alternate spellings for common Whisper mishearings (e.g., "clawde" for "Claude")
 DEFAULT_LLM_TRIGGERS = [
-    {"trigger": ["for claude", "for claude code"], "mode": "claude"},
+    {"trigger": ["for claude", "for claude code", "for clawde", "for clawde code", "for clawed code"], "mode": "claude"},
     {"trigger": ["for chatgpt", "for gpt", "for chat gpt"], "mode": "chatgpt"},
     {"trigger": ["for codex", "for code"], "mode": "code"},
 ]
