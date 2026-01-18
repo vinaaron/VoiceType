@@ -134,6 +134,7 @@ def refine_with_ollama(text: str, mode: str, url: str = "http://localhost:11434"
         "prompt": text,
         "system": system_prompt,
         "stream": False,
+        "think": False,  # Disable thinking mode for Qwen3 (safe to include for all models)
         "options": {
             "temperature": 0.3
         }
