@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-VoiceType is a macOS voice-to-text tool for terminal sessions. Press a hotkey, speak, and text appears at your cursor. Uses Silero VAD for intelligent speech detection and faster-whisper for local transcription.
+VoiceType is a macOS voice-to-text tool for terminal sessions. Press a hotkey, speak, and text appears at your cursor. Uses Silero VAD for intelligent speech detection and multiple transcription backends.
 
 ## Commands
 
@@ -20,6 +20,13 @@ VoiceType is a macOS voice-to-text tool for terminal sessions. Press a hotkey, s
 
 # Test with fixed duration (bypass VAD)
 ~/.voice-cli-venv/bin/python bin/voice-cli --no-vad --duration 3
+
+# Test LLM refinement directly
+~/.voice-cli-venv/bin/python -c "
+from src.llm_refine import refine_text
+result = refine_text('um so like add a button', 'claude', {'llm_backend': 'ollama', 'ollama_model': 'gemma2:2b'})
+print(result)
+"
 ```
 
 No test suite exists yet.
@@ -31,32 +38,137 @@ Raycast hotkey → voice-toggle.sh → bin/voice-cli
                                         ↓
                               vad_record.py (Silero VAD)
                                         ↓
-                              transcribe.py (faster-whisper)
+                    ┌───────────────────┼───────────────────┐
+                    ↓                   ↓                   ↓
+            mlx_transcribe.py   transcribe.py      groq_transcribe.py
+            (MLX - fastest)     (faster-whisper)   (Groq cloud API)
+                    └───────────────────┼───────────────────┘
+                                        ↓
+                              llm_refine.py (optional, trigger-based)
                                         ↓
                               number_words.py (optional)
                                         ↓
                               output.py (clipboard + osascript paste)
 ```
 
+### Transcription Backends
+
+| Mode | Speed | Requires | Notes |
+|------|-------|----------|-------|
+| `mlx` | Fastest | Apple Silicon | Default. May cause crashes on some systems |
+| `groq` | Fast | API key | Cloud-based, most reliable |
+| `local` | Slower | CPU | faster-whisper, fallback option |
+
+### LLM Refinement (Speech Cleanup)
+
+Cleans transcribed speech by removing filler words (um, uh, like, etc.) when trigger phrases are detected.
+
+**Trigger phrases** (say at END of speech):
+- "for claude", "for claude code", "for clawde", "for clawed code" → claude mode
+- "for chatgpt", "for gpt" → chatgpt mode
+- "for code", "for codex" → code mode
+
+**Backends** (configured in config.yaml):
+- `auto` - Tries Ollama first, falls back to Groq
+- `ollama` - Local only (requires `ollama serve`)
+- `groq` - Cloud only (requires GROQ_API_KEY)
+
+**Recommended Ollama models**:
+- `gemma2:2b` - Fast (~0.5s), good for simple cleanup, no preambles
+- `qwen3:4b-instruct-2507-q4_K_M` - Slower (~1.5s), better at preserving meaning
+
+**Important**: Do NOT use `qwen3:4b` (base) - it has thinking mode enabled by default causing 30+ second delays. Use the `-instruct` variant instead.
+
 ### Key Data Flow
 
 1. **Recording**: `vad_record.py` uses PyAudio + Silero VAD to record until silence (32ms chunks, 512 samples at 16kHz)
-2. **Transcription**: `transcribe.py` uses faster-whisper with lazy-loaded model (int8 quantization on CPU)
-3. **Output**: `output.py` copies to clipboard, activates original app, pastes via Cmd+V (required because Raycast becomes frontmost)
+2. **Transcription**: Depends on `transcription_mode` in config
+3. **LLM Refinement**: If trigger phrase detected, cleans up speech via Ollama/Groq
+4. **Output**: `output.py` copies to clipboard, activates original app, pastes via Cmd+V
 
 ### Critical Implementation Details
 
 - **VAD chunk size**: Silero VAD requires exactly 512 samples at 16kHz (32ms). Other sizes will error.
 - **Model pre-loading**: VAD model must load BEFORE the Ping sound plays, otherwise first words get missed
 - **Async sound**: `play_sound()` uses `subprocess.Popen` (not `.run`) to avoid blocking recording start
-- **Enter triggers**: `check_enter_trigger()` strips punctuation (`.!?,;:`) before checking for "send"/"enter" because Whisper adds trailing punctuation
+- **Enter triggers**: `check_enter_trigger()` strips punctuation (`.!?,;:`) before checking for "send"/"enter"
+- **Whisper mishearing**: Whisper often transcribes "Claude" as "clawde" or "clawed" - trigger detection handles this
+- **Qwen3 thinking mode**: Must pass `"think": False` in Ollama API payload to disable thinking mode
+
+### File Storage
+
+| File | Purpose | Accumulates? |
+|------|---------|--------------|
+| `~/.voice-cli/config.yaml` | User settings | No |
+| `~/.voice-cli/recording.wav` | Temp audio | No (overwritten each time) |
+| `~/.voice-cli/raycast.log` | Debug logs | Yes (may need cleanup) |
+| `~/.voice-cli/voice-cli.lock` | Prevents double-run | No |
+
+**Transcripts are NOT stored** - they go directly to clipboard.
 
 ### Configuration
 
 User config: `~/.voice-cli/config.yaml`
-Logs: `~/.voice-cli/raycast.log`
-Temp audio: `~/.voice-cli/recording.wav`
+
+Key settings:
+```yaml
+# Transcription mode: mlx (fastest), groq (cloud), local (fallback)
+transcription_mode: mlx
+
+# MLX/local models: distil-small.en (fastest), distil-medium.en (balanced)
+model: distil-medium.en
+
+# LLM refinement (speech cleanup)
+llm_refinement: true
+llm_backend: auto  # auto, ollama, or groq
+ollama_model: gemma2:2b  # or qwen3:4b-instruct-2507-q4_K_M
+```
+
+### Environment Variables
+
+Create `.env` file in project root (loaded automatically):
+```bash
+GROQ_API_KEY=gsk_...  # Required for groq transcription or LLM fallback
+```
 
 ## macOS Permissions
 
 Raycast needs both Microphone and Accessibility permissions (not the terminal) because Raycast spawns the subprocess.
+
+## Ollama Setup
+
+```bash
+# Install Ollama
+brew install ollama
+
+# Start server (required for local LLM refinement)
+ollama serve
+
+# Pull recommended models
+ollama pull gemma2:2b                          # Fast, no preambles
+ollama pull qwen3:4b-instruct-2507-q4_K_M      # Better quality
+
+# Models stored in: ~/.ollama/models/
+# Server runs on: http://localhost:11434
+```
+
+## Known Issues
+
+1. **Mac crashes during transcription**: MLX mode with distil-medium.en may cause system crashes on some configurations. Try switching to `groq` mode or using `distil-small.en`.
+
+2. **Groq 403 errors**: Check GROQ_API_KEY is set correctly in `.env` file.
+
+3. **Ollama connection refused**: Run `ollama serve` before using Ollama backend.
+
+4. **Qwen3 30+ second delays**: Use `qwen3:4b-instruct-*` variant, not base `qwen3:4b`.
+
+## System Prompt Design (for LLM refinement)
+
+The prompts in `src/llm_refine.py` are optimized for small models (2B-4B params):
+
+- **Context**: "Clean transcribed speech for a coding assistant"
+- **Positive framing**: "Output only X" instead of "Do NOT do Y"
+- **Examples**: 5 input/output pairs guide the model
+- **Filler words**: um, uh, like, you know, so, basically, I mean, okay, well, right, actually, yeah
+
+The prompts are CONSERVATIVE - they clean up speech without adding assumptions about technology or approach, because Claude Code already has full project context.
