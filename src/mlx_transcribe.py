@@ -10,6 +10,18 @@ _whisper_model = None
 _current_model_name = None
 
 
+def unload_mlx_model() -> bool:
+    """Drop the cached model so the OS can reclaim its RAM. The next
+    transcribe call will reload it (~3-4s one-time cost). Returns True
+    if there was a model loaded to unload."""
+    global _whisper_model, _current_model_name
+    if _whisper_model is None:
+        return False
+    _whisper_model = None
+    _current_model_name = None
+    return True
+
+
 def get_mlx_model(model_name: str = "distil-medium.en"):
     """
     Get or create the Lightning Whisper MLX model.

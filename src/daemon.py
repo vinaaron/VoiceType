@@ -47,6 +47,7 @@ PIDFILE = Path.home() / ".voice-cli" / "daemon.pid"
 _state_lock = threading.Lock()
 _current_session: "Session | None" = None
 _shutdown_event = threading.Event()
+_last_activity = time.monotonic()  # bumped each time a command arrives
 
 
 class Session:
@@ -110,6 +111,7 @@ def load_config() -> dict:
         "llm_model": "llama-3.3-70b-versatile",
         "ollama_url": "http://localhost:11434",
         "llm_triggers": None,
+        "daemon_mlx_idle_minutes": 30,
     }
     if os.path.exists(yaml_path):
         try:
@@ -168,7 +170,7 @@ def preload_models(config: dict) -> None:
 
 
 def handle_command(conn: socket.socket) -> None:
-    global _current_session
+    global _current_session, _last_activity
     try:
         conn.settimeout(5.0)
         data = conn.recv(4096).decode("utf-8").strip()
@@ -176,6 +178,7 @@ def handle_command(conn: socket.socket) -> None:
             return
         cmd = json.loads(data)
         op = cmd.get("op")
+        _last_activity = time.monotonic()
         log_info(f"daemon recv op={op}")
 
         if op == "toggle":
@@ -247,6 +250,30 @@ def cleanup_socket() -> None:
         pass
 
 
+def idle_reaper(timeout_seconds: float) -> None:
+    """Unload the MLX model when the daemon has been idle for too long.
+    The daemon stays alive — only the model is dropped. Next press pays a
+    one-time ~3-4s reload cost; subsequent presses are fast again."""
+    if timeout_seconds <= 0:
+        return
+    while not _shutdown_event.is_set():
+        _shutdown_event.wait(timeout=60.0)
+        if _shutdown_event.is_set():
+            break
+        idle = time.monotonic() - _last_activity
+        if idle < timeout_seconds:
+            continue
+        with _state_lock:
+            if _current_session is not None and _current_session.alive():
+                continue  # active recording — don't yank the model out
+        try:
+            from mlx_transcribe import unload_mlx_model
+            if unload_mlx_model():
+                log_info(f"idle {int(idle)}s ≥ {int(timeout_seconds)}s — MLX model unloaded")
+        except Exception as e:
+            log_error(f"idle reaper unload failed: {e}")
+
+
 def main() -> int:
     get_logger()
 
@@ -265,6 +292,13 @@ def main() -> int:
         preload_models(config)
     except Exception as e:
         log_error(f"preload failed: {e}")
+
+    idle_minutes = float(config.get("daemon_mlx_idle_minutes", 30))
+    if idle_minutes > 0:
+        threading.Thread(
+            target=idle_reaper, args=(idle_minutes * 60.0,), daemon=True,
+        ).start()
+        log_info(f"idle reaper enabled: unload MLX after {idle_minutes}min idle")
 
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

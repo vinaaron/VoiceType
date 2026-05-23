@@ -142,6 +142,7 @@ def load_config():
         "llm_model": "llama-3.3-70b-versatile",
         "ollama_url": "http://localhost:11434",
         "llm_triggers": None,
+        "daemon_mlx_idle_minutes": 30,
     }
 
     if os.path.exists(yaml_path):
