@@ -126,28 +126,31 @@ def run_voice_session(
     # of utterance length.
     if transcription_mode == "moonshine" and use_vad:
         try:
-            from moonshine_transcribe import get_moonshine_model, reset_stream, finalize
+            from moonshine_transcribe import open_session_stream, close_session_stream, finalize
             from vad_record import record_with_vad_streaming
-            transcriber = get_moonshine_model(config)
-            reset_stream(transcriber)
+            # Per-session Stream — clean accumulator, no leak from prior sessions.
+            stream = open_session_stream(config)
             try:
-                record_with_vad_streaming(
-                    transcriber,
-                    silence_duration=silence_duration,
-                    max_duration=max_duration,
-                    speech_threshold=vad_threshold,
-                    on_audio_level=on_audio_level if show_indicator else None,
-                    stop_event=stop_event,
-                )
+                try:
+                    record_with_vad_streaming(
+                        stream,
+                        silence_duration=silence_duration,
+                        max_duration=max_duration,
+                        speech_threshold=vad_threshold,
+                        on_audio_level=on_audio_level if show_indicator else None,
+                        stop_event=stop_event,
+                    )
+                finally:
+                    if indicator:
+                        hide_recording_indicator(indicator)
+
+                log_stage("record_end")
+                if use_sound:
+                    play_sound("Pop")
+
+                text = finalize(stream)
             finally:
-                if indicator:
-                    hide_recording_indicator(indicator)
-
-            log_stage("record_end")
-            if use_sound:
-                play_sound("Pop")
-
-            text = finalize(transcriber)
+                close_session_stream(stream)
             log_stage("transcribe_end")
 
             if not text:

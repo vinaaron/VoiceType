@@ -127,29 +127,46 @@ def unload_moonshine_model() -> bool:
     return True
 
 
-def reset_stream(tx) -> None:
-    """Clear any prior session's accumulated transcript state on the
-    Transcriber so a new recording starts fresh. moonshine-voice doesn't
-    expose a clean reset, so we re-instantiate at the variant level."""
-    # The Transcriber accumulates lines across update_transcription calls.
-    # For now we work around this by reading-and-discarding the current
-    # state on session start. If this proves insufficient we'll swap to
-    # constructing a fresh Transcriber per session.
+def open_session_stream(config: dict | None = None):
+    """
+    Open a fresh per-session Stream from the cached Transcriber.
+
+    Returns a moonshine_voice Stream that has its own accumulator state —
+    no leakage from prior sessions. Caller is responsible for stop()/close()
+    via close_session_stream() when done.
+
+    The Transcriber (model + ONNX runtime + tokenizer) is reused across
+    sessions, so this is cheap: only the per-stream state is allocated.
+    """
+    tx = get_moonshine_model(config)
+    stream = tx.create_stream(update_interval=0.3)
+    stream.start()
+    return stream
+
+
+def close_session_stream(stream) -> None:
+    """Stop and close a per-session Stream. Idempotent on errors."""
+    if stream is None:
+        return
     try:
-        tx.update_transcription()
+        stream.stop()
+    except Exception:
+        pass
+    try:
+        stream.close()
     except Exception:
         pass
 
 
-def finalize(tx, max_iters: int = 20, settle_delay_s: float = 0.05) -> str:
-    """Drain any remaining partial output and return the final transcript
-    as a single space-joined string. Polls update_transcription() until
-    the text stabilises (i.e. two consecutive identical reads)."""
+def finalize(stream, max_iters: int = 20, settle_delay_s: float = 0.05) -> str:
+    """Drain any remaining partial output from a Stream and return the
+    final transcript as a single space-joined string. Polls until the
+    text stabilises (two consecutive identical reads)."""
     import time
     prev = None
     final_lines = []
     for _ in range(max_iters):
-        t = tx.update_transcription()
+        t = stream.update_transcription()
         cur = " ".join(line.text.strip() for line in t.lines if line.text.strip())
         if cur == prev:
             final_lines = [line.text.strip() for line in t.lines if line.text.strip()]

@@ -180,7 +180,7 @@ def record_with_vad(
 
 
 def record_with_vad_streaming(
-    transcriber,
+    stream,
     silence_duration=2.0,
     max_duration=30,
     speech_threshold=0.5,
@@ -193,16 +193,18 @@ def record_with_vad_streaming(
 
     Records via PyAudio + Silero VAD (same gate semantics as record_with_vad),
     but instead of accumulating frames and writing a WAV at the end, this
-    function pushes audio chunks directly into a Moonshine `Transcriber`
-    as they arrive — so the model processes audio while the user is still
+    function pushes audio chunks directly into a Moonshine `Stream` as
+    they arrive — so the model processes audio while the user is still
     speaking and the final transcript is ready ~150ms after end-of-speech
     regardless of utterance length.
 
     Args:
-        transcriber: A live moonshine_voice.Transcriber instance (already
-                     started, warmed up). The caller owns its lifecycle
-                     and reads the final transcript via
-                     moonshine_transcribe.finalize(tx) after this returns.
+        stream: A live moonshine_voice Stream (per-session, from
+                Transcriber.create_stream(), already started). The caller
+                owns its lifecycle and reads the final transcript via
+                moonshine_transcribe.finalize(stream) after this returns.
+                Each session MUST use a fresh Stream — sharing one across
+                sessions leaks prior transcripts into new ones.
         silence_duration: Seconds of post-speech silence before stopping.
         max_duration: Safety cap in seconds.
         speech_threshold: VAD confidence threshold (0-1).
@@ -248,10 +250,9 @@ def record_with_vad_streaming(
         def flush_feed():
             if not feed_buffer:
                 return
-            # Concatenate, convert to float32 list, feed to transcriber.
             combined_int16 = np.concatenate(feed_buffer)
             combined_float = (combined_int16.astype(np.float32) / 32768.0).tolist()
-            transcriber.add_audio(combined_float, sample_rate=SAMPLE_RATE)
+            stream.add_audio(combined_float, sample_rate=SAMPLE_RATE)
             feed_buffer.clear()
 
         for _ in range(max_chunks):
