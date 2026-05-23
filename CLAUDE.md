@@ -91,6 +91,25 @@ repos, weird jargon, people-names). The file is read each session and
 passed to Whisper as `initial_prompt`, which biases transcription toward
 those terms. Lines starting with `#` are ignored.
 
+### Visual HUD (swift/)
+
+A separate SwiftUI app (`VoiceCLIVisual`) subscribes to the daemon's
+socket and renders a floating audio-reactive blob during recording. See
+`swift/README.md` for build/run. It subscribes via `{"op":"subscribe"}`
+and receives newline-delimited JSON events:
+
+| Event | Fired by |
+|-------|----------|
+| `recording_started` | session start |
+| `level` (0–1)       | each Silero VAD chunk during recording |
+| `transcribing`      | record_end, before finalize |
+| `paste_done`        | after clipboard paste |
+| `recording_ended`   | after the Pop sound |
+| `session_failed`    | exception in the streaming path |
+
+The protocol is fan-out: multiple subscribers can connect simultaneously.
+Disconnections are detected on next write and the daemon drops them.
+
 ### Transcription Backends
 
 | Mode | Speed | Requires | Notes |

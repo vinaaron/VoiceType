@@ -53,17 +53,6 @@ def write_pidfile() -> None:
         f.write(str(os.getpid()))
 
 
-def sweep_orphan_indicators() -> None:
-    """Kill any leftover menu_bar_indicator subprocesses from prior crashed runs."""
-    try:
-        subprocess.run(
-            ["pkill", "-9", "-f", "menu_bar_indicator"],
-            check=False, capture_output=True,
-        )
-    except FileNotFoundError:
-        pass
-
-
 def remove_pidfile() -> None:
     try:
         if os.path.exists(PID_FILE):
@@ -130,7 +119,6 @@ def load_config():
         "sound_feedback": True,
         "convert_numbers": True,
         "show_notifications": True,
-        "show_recording_indicator": True,
         "vad_mode": True,
         "vad_threshold": 0.5,
         "max_duration": 300,
@@ -202,7 +190,6 @@ def main():
     if signal_running_instance_or_claim():
         return
 
-    sweep_orphan_indicators()
     atexit.register(remove_pidfile)
     signal.signal(signal.SIGUSR1, _handle_stop_signal)
 

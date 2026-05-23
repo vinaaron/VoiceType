@@ -51,6 +51,28 @@ _current_session: "Session | None" = None
 _shutdown_event = threading.Event()
 _last_activity = time.monotonic()  # bumped each time a command arrives
 _transcript_history: deque = deque(maxlen=10)  # recent finished sessions for revert/replay
+_subscribers: list = []  # sockets subscribed to session-event broadcasts
+_subscribers_lock = threading.Lock()
+
+
+def _broadcast_event(event: dict) -> None:
+    """Fan-out a session event to all currently-subscribed sockets.
+    Drops sockets that error out. Called from session.run_voice_session
+    via the publish() hook installed in main()."""
+    payload = (json.dumps(event) + "\n").encode("utf-8")
+    with _subscribers_lock:
+        dead = []
+        for sock in _subscribers:
+            try:
+                sock.sendall(payload)
+            except OSError:
+                dead.append(sock)
+        for sock in dead:
+            _subscribers.remove(sock)
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
 class Session:
@@ -111,7 +133,6 @@ def load_config() -> dict:
         "sound_feedback": True,
         "convert_numbers": True,
         "show_notifications": True,
-        "show_recording_indicator": True,
         "vad_mode": True,
         "vad_threshold": 0.5,
         "max_duration": 300,
@@ -288,6 +309,14 @@ def handle_command(conn: socket.socket) -> None:
                 _backspace(final_len)
                 _paste_text(entry["raw"], entry.get("target_app"))
                 conn.sendall((json.dumps({"state": "reverted", "removed": final_len}) + "\n").encode())
+        elif op == "subscribe":
+            # Register this socket as a broadcast listener. We do NOT
+            # close it on return — the caller (handle_command) checks
+            # this op specifically and just returns without close().
+            with _subscribers_lock:
+                _subscribers.append(conn)
+            conn.sendall(b'{"state":"subscribed"}\n')
+            return  # KEEP THE SOCKET OPEN; we'll write events to it.
         elif op == "shutdown":
             conn.sendall(b'{"state":"shutting_down"}\n')
             _shutdown_event.set()
@@ -300,6 +329,10 @@ def handle_command(conn: socket.socket) -> None:
         except OSError:
             pass
     finally:
+        # Don't close subscriber sockets — they stay open for broadcasts.
+        with _subscribers_lock:
+            if conn in _subscribers:
+                return
         try:
             conn.close()
         except OSError:
@@ -409,6 +442,10 @@ def main() -> int:
             target=idle_reaper, args=(idle_minutes * 60.0,), daemon=True,
         ).start()
         log_info(f"idle reaper enabled: unload MLX after {idle_minutes}min idle")
+
+    # Hook session events → broadcast to subscribers.
+    from session import add_event_subscriber
+    add_event_subscriber(_broadcast_event)
 
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

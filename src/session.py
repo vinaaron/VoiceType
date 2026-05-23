@@ -15,11 +15,40 @@ from output import (
     type_text_via_clipboard, play_sound, notify,
     get_frontmost_app, press_enter,
 )
-from recording_indicator import show_recording_indicator, hide_recording_indicator
 from logger import log_stage, log_info, log_error
 
 
 _DICTIONARY_PATH = os.path.expanduser("~/.voice-cli/dictionary.txt")
+
+
+# Event-bus for UI consumers (e.g. the SwiftUI HUD app). Anyone in-process
+# can register a callback to receive recording lifecycle + audio level
+# events. The daemon registers a subscriber that fans these out over
+# Unix-socket connections. Default = empty list = no-op for bin/voice-cli.
+_event_subscribers: list = []
+
+
+def add_event_subscriber(callback) -> None:
+    """Register a callable(event: dict) to receive session events.
+    Events: recording_started, level, transcribing, paste_done,
+    recording_ended, session_failed."""
+    _event_subscribers.append(callback)
+
+
+def remove_event_subscriber(callback) -> None:
+    try:
+        _event_subscribers.remove(callback)
+    except ValueError:
+        pass
+
+
+def _publish(event: dict) -> None:
+    """Fan-out event to all registered subscribers. Never raises."""
+    for cb in list(_event_subscribers):
+        try:
+            cb(event)
+        except Exception:
+            pass
 
 
 def load_personal_dictionary() -> str | None:
@@ -87,7 +116,6 @@ def run_voice_session(
     use_sound = config["sound_feedback"]
     convert_nums = config["convert_numbers"]
     show_notify = config.get("show_notifications", True)
-    show_indicator = config.get("show_recording_indicator", True)
     use_vad = config.get("vad_mode", True)
     vad_threshold = config.get("vad_threshold", 0.5)
     max_duration = config.get("max_duration", 30)
@@ -114,14 +142,6 @@ def run_voice_session(
     if use_sound:
         play_sound("Ping")
 
-    indicator = None
-    if show_indicator:
-        indicator = show_recording_indicator()
-
-    def on_audio_level(level):
-        if indicator:
-            indicator.update_level(level)
-
     # === Streaming path: Moonshine v2 ===
     # When transcription_mode is "moonshine" we bypass the WAV-then-batch
     # pipeline entirely. Audio is fed into the model as it's recorded, so
@@ -131,26 +151,28 @@ def run_voice_session(
         try:
             from moonshine_transcribe import open_session_stream, close_session_stream, finalize
             from vad_record import record_with_vad_streaming
-            # Per-session Stream — clean accumulator, no leak from prior sessions.
+            _publish({"event": "recording_started", "mode": "moonshine"})
+
+            def streaming_on_level(level):
+                _publish({"event": "level", "value": float(level)})
+
             stream = open_session_stream(config)
             try:
-                try:
-                    record_with_vad_streaming(
-                        stream,
-                        silence_duration=silence_duration,
-                        max_duration=max_duration,
-                        speech_threshold=vad_threshold,
-                        on_audio_level=on_audio_level if show_indicator else None,
-                        stop_event=stop_event,
-                    )
-                finally:
-                    if indicator:
-                        hide_recording_indicator(indicator)
+                record_with_vad_streaming(
+                    stream,
+                    silence_duration=silence_duration,
+                    max_duration=max_duration,
+                    speech_threshold=vad_threshold,
+                    on_audio_level=streaming_on_level,
+                    stop_event=stop_event,
+                )
 
                 log_stage("record_end")
+                _publish({"event": "recording_ended"})
                 if use_sound:
                     play_sound("Pop")
 
+                _publish({"event": "transcribing"})
                 text = finalize(stream)
             finally:
                 close_session_stream(stream)
@@ -204,6 +226,7 @@ def run_voice_session(
                     notify("Voice CLI", f"{action}: {text[:50]}...")
 
             log_stage("paste_done")
+            _publish({"event": "paste_done", "text": text})
             return {
                 "ok": True,
                 "text": text,
@@ -213,33 +236,34 @@ def run_voice_session(
             }
         except ImportError as e:
             log_error(f"moonshine not available ({e}), falling back to batch MLX")
+            _publish({"event": "session_failed", "reason": "moonshine_unavailable"})
         except Exception as e:
             log_error(f"moonshine streaming failed: {e}, falling back to batch MLX")
+            _publish({"event": "session_failed", "reason": str(e)[:120]})
             import traceback
             traceback.print_exc()
 
     # === Batch path: MLX Whisper / Groq / Parakeet ===
-    try:
-        if use_vad:
-            from vad_record import record_with_vad
-            try:
-                audio_path = record_with_vad(
-                    silence_duration=silence_duration,
-                    max_duration=max_duration,
-                    speech_threshold=vad_threshold,
-                    on_audio_level=on_audio_level if show_indicator else None,
-                    stop_event=stop_event,
-                )
-            except Exception as e:
-                log_error(f"VAD failed, using fixed duration: {e}")
-                from record import record_fixed_duration
-                audio_path = record_fixed_duration(duration=duration)
-        else:
+    def batch_on_level(level):
+        _publish({"event": "level", "value": float(level)})
+
+    if use_vad:
+        from vad_record import record_with_vad
+        try:
+            audio_path = record_with_vad(
+                silence_duration=silence_duration,
+                max_duration=max_duration,
+                speech_threshold=vad_threshold,
+                on_audio_level=batch_on_level,
+                stop_event=stop_event,
+            )
+        except Exception as e:
+            log_error(f"VAD failed, using fixed duration: {e}")
             from record import record_fixed_duration
             audio_path = record_fixed_duration(duration=duration)
-    finally:
-        if indicator:
-            hide_recording_indicator(indicator)
+    else:
+        from record import record_fixed_duration
+        audio_path = record_fixed_duration(duration=duration)
 
     log_stage("record_end")
 
