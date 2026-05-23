@@ -68,9 +68,10 @@ If the daemon isn't running (e.g. first press of a session, crash), the
 client spawns it in the background and falls back to `bin/voice-cli` for
 that one press. The next press hits the now-warm daemon.
 
-To restart the daemon: `pkill -f "python -m daemon"`; next hotkey press
-will respawn it. To stop it without restart: send `{"op":"shutdown"}` over
-the socket.
+To restart the daemon: `pkill -if "python -m daemon"` (the `-i` is
+critical — the actual process name is `Python` from `Python.app`, not
+lowercase). Next hotkey press will respawn it. To stop it without
+restart: send `{"op":"shutdown"}` over the socket.
 
 ### Additional hotkeys (Raycast scripts)
 
