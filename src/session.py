@@ -49,7 +49,10 @@ def check_enter_trigger(text: str, triggers: list) -> tuple:
         if text_lower.endswith(trigger):
             prefix = text_lower[:-len(trigger)]
             if prefix == "" or prefix.endswith(" "):
-                cleaned = text_stripped[:len(prefix)].rstrip()
+                # Strip trailing punctuation from the cleaned text too —
+                # Moonshine often emits a comma before the trigger word
+                # ("...said, enter") and we don't want to paste that.
+                cleaned = text_stripped[:len(prefix)].rstrip(" .!?,;:")
                 return (cleaned, True)
     return (text, False)
 
