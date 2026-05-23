@@ -137,10 +137,24 @@ def open_session_stream(config: dict | None = None):
 
     The Transcriber (model + ONNX runtime + tokenizer) is reused across
     sessions, so this is cheap: only the per-stream state is allocated.
+
+    The new stream is warmed up with 100ms of silence + a drain pass so
+    the first real-audio chunk doesn't pay first-call ONNX allocation
+    overhead. Hides ~150-500ms of cold-start latency at session start
+    (before the Ping plays) rather than after end-of-speech.
     """
     tx = get_moonshine_model(config)
-    stream = tx.create_stream(update_interval=0.3)
+    # update_interval=0.1 tells Moonshine to drain its audio queue every
+    # 100ms instead of every 300ms — keeps the background processor
+    # more aggressively fed when our daemon's threading puts pressure
+    # on the GIL between PyAudio capture and Moonshine inference.
+    stream = tx.create_stream(update_interval=0.1)
     stream.start()
+    # Warm-up: 100ms of silence + drain. Without this, the first real
+    # add_audio call on a fresh stream allocates KV caches and ONNX
+    # buffers — which makes finalize() block waiting for chunks to drain.
+    stream.add_audio([0.0] * 1600, sample_rate=16000)
+    stream.update_transcription()
     return stream
 
 
@@ -158,10 +172,14 @@ def close_session_stream(stream) -> None:
         pass
 
 
-def finalize(stream, max_iters: int = 20, settle_delay_s: float = 0.05) -> str:
+def finalize(stream, max_iters: int = 40, settle_delay_s: float = 0.05) -> str:
     """Drain any remaining partial output from a Stream and return the
     final transcript as a single space-joined string. Polls until the
-    text stabilises (two consecutive identical reads)."""
+    text stabilises (two consecutive identical reads).
+
+    max_iters * settle_delay_s caps total wait at 2s — enough headroom
+    for long utterances where the model is still catching up with
+    queued audio chunks at end-of-recording."""
     import time
     prev = None
     final_lines = []
