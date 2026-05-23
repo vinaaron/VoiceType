@@ -17,21 +17,50 @@ enum SessionState {
     case transcribing
 }
 
-/// Borderless floating panel that hosts the SwiftUI blob view.
-/// .nonactivatingPanel + ignoresMouseEvents means it never steals focus
-/// from whatever app the user was typing into.
+/// A non-key, non-activating panel that hosts the HUD. Critical that
+/// canBecomeKey returns false so the panel never steals focus from the
+/// app the user is dictating into, even momentarily during animation.
+final class NonActivatingPanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+/// Custom NSView that clips its layer to a circle. Used as the host
+/// for NSVisualEffectView so we get a perfect circular glass pill.
+final class CircularClipView: NSView {
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        layer?.cornerRadius = bounds.width / 2
+        layer?.masksToBounds = true
+    }
+
+    override func layout() {
+        super.layout()
+        layer?.cornerRadius = bounds.width / 2
+    }
+}
+
+/// Borderless floating panel that hosts an NSVisualEffectView (the glass)
+/// containing a SwiftUI NSHostingView (the blob). Uses NSVisualEffectView
+/// directly rather than SwiftUI's `.glassEffect()` because the latter
+/// renders flat on a transparent NSPanel — there's no backdrop for it
+/// to sample. NSVisualEffectView samples the screen content behind the
+/// window properly.
 final class HUDWindow {
-    private let panel: NSPanel
+    private let panel: NonActivatingPanel
     private let viewModel: HUDViewModel
+    private let visualEffectView: NSVisualEffectView
     private var hideTask: DispatchWorkItem?
+
+    /// Outer pill diameter. Blob/halo scale relative to this.
+    private let pillSize: CGFloat = 108
 
     init(viewModel: HUDViewModel) {
         self.viewModel = viewModel
 
-        // Panel is sized to fit BlobView's outer frame (pillSize + breathing room).
-        // Keep this in sync with BlobView.pillSize + 12 to prevent edge clipping.
-        let size = NSSize(width: 108, height: 108)
-        panel = NSPanel(
+        let size = NSSize(width: pillSize, height: pillSize)
+        panel = NonActivatingPanel(
             contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.nonactivatingPanel, .borderless],
             backing: .buffered,
@@ -42,21 +71,41 @@ final class HUDWindow {
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = false
+        panel.hasShadow = true
         panel.ignoresMouseEvents = true
         panel.isMovableByWindowBackground = false
         panel.titleVisibility = .hidden
         panel.titlebarAppearsTransparent = true
         panel.alphaValue = 0
+        panel.hidesOnDeactivate = false
 
-        // NSHostingView defaults to opaque on some macOS versions — force
-        // its backing layer transparent so we only see the SwiftUI content
-        // (the glass pill draws its own translucent background).
+        // Circular glass via NSVisualEffectView. .hudWindow gives a
+        // classic translucent vibrancy; .behindWindow blending samples
+        // what's behind the panel on screen so it actually looks like
+        // glass (not just a tinted solid).
+        let circular = CircularClipView(frame: NSRect(origin: .zero, size: size))
+        circular.wantsLayer = true
+        circular.layer?.backgroundColor = .clear
+
+        visualEffectView = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
+        visualEffectView.material = .hudWindow
+        visualEffectView.blendingMode = .behindWindow
+        visualEffectView.state = .active
+        visualEffectView.autoresizingMask = [.width, .height]
+        visualEffectView.wantsLayer = true
+        circular.addSubview(visualEffectView)
+
+        // Blob host. Same size as the pill — the blob draws itself with
+        // a generous safety margin inside, so it never touches the
+        // circular clip even at peak energy.
         let host = NSHostingView(rootView: BlobView(viewModel: viewModel))
         host.frame = NSRect(origin: .zero, size: size)
+        host.autoresizingMask = [.width, .height]
         host.wantsLayer = true
         host.layer?.backgroundColor = .clear
-        panel.contentView = host
+        circular.addSubview(host)
+
+        panel.contentView = circular
     }
 
     /// Show the HUD positioned near a screen point (typically the mouse).
@@ -66,8 +115,6 @@ final class HUDWindow {
         hideTask = nil
 
         let size = panel.frame.size
-        // Position slightly above-and-right of anchor, clamped to the
-        // current screen so we never spawn off-edge.
         var origin = NSPoint(
             x: anchor.x - size.width / 2,
             y: anchor.y + 30
@@ -78,6 +125,9 @@ final class HUDWindow {
             origin.y = max(vis.minY + 8, min(origin.y, vis.maxY - size.height - 8))
         }
         panel.setFrameOrigin(origin)
+        // orderFrontRegardless doesn't activate the app for a
+        // .nonactivatingPanel, but combined with our canBecomeKey=false
+        // override we have belt+braces against focus stealing.
         panel.orderFrontRegardless()
 
         viewModel.state = .listening

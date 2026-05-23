@@ -145,10 +145,12 @@ def type_text_via_clipboard(text: str, target_app: str = None) -> None:
     paste_from_clipboard()
 
     # Give the receiving app a beat to actually consume the paste before
-    # we swap the clipboard back. Without this, fast apps can see the
-    # restored content instead.
+    # we swap the clipboard back. 300ms is conservative — even slow
+    # Electron-based targets (Cursor, VSCode, Claude Code) finish their
+    # paste handling within ~200ms, but we'd rather have a slow restore
+    # than risk pasting our restored content into the wrong field.
     import time as _time
-    _time.sleep(0.15)
+    _time.sleep(0.30)
     write_clipboard_bytes(saved_clipboard)
 
 
