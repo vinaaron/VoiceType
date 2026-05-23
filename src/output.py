@@ -35,20 +35,34 @@ def activate_app(app_name: str) -> None:
     """
     Bring an application to the front (make it frontmost).
 
-    Args:
-        app_name: Name of the application to activate
+    `app_name` here is the System Events PROCESS name (e.g. "wezterm-gui"),
+    which is what get_frontmost_app() returns. `tell application "X"`
+    wants the BUNDLE display name (e.g. "WezTerm") and silently errors
+    with -1728 for process names. So we use the `application process`
+    form which accepts the process name directly.
+
+    If anything goes wrong, log the AppleScript stderr instead of
+    swallowing it — this paste-failure cause cost us hours of debugging.
     """
+    if not app_name:
+        return
     script = f'''
-    tell application "{app_name}"
-        activate
+    tell application "System Events"
+        set frontmost of (first application process whose name is "{app_name}") to true
     end tell
     '''
-
-    subprocess.run(
+    result = subprocess.run(
         ["osascript", "-e", script],
         check=False,
-        capture_output=True
+        capture_output=True,
+        text=True,
     )
+    if result.returncode != 0 and result.stderr:
+        try:
+            from logger import log_error
+            log_error(f"activate_app({app_name!r}) osascript failed: {result.stderr.strip()}")
+        except ImportError:
+            pass
 
 
 def copy_to_clipboard(text: str) -> None:
@@ -88,35 +102,52 @@ def write_clipboard_bytes(data: bytes) -> None:
 def paste_from_clipboard() -> None:
     """
     Simulate Cmd+V keystroke to paste from clipboard.
+
+    Logs osascript errors instead of swallowing them. The classic
+    failure is `(1002) osascript is not allowed to send keystrokes`,
+    which means the binary launching us doesn't have Accessibility
+    permission. When the daemon is spawned by Raycast (the normal
+    hotkey path), it inherits Raycast's grant. When spawned manually
+    from a terminal without that inheritance, paste silently fails.
     """
     script = '''
     tell application "System Events"
         keystroke "v" using command down
     end tell
     '''
-
-    subprocess.run(
+    result = subprocess.run(
         ["osascript", "-e", script],
         check=False,
-        capture_output=True
+        capture_output=True,
+        text=True,
     )
+    if result.returncode != 0 and result.stderr:
+        try:
+            from logger import log_error
+            log_error(f"paste_from_clipboard osascript failed: {result.stderr.strip()}")
+        except ImportError:
+            pass
 
 
 def press_enter() -> None:
-    """
-    Simulate pressing the Enter/Return key.
-    """
+    """Simulate pressing Return. Same permission requirement as paste."""
     script = '''
     tell application "System Events"
         keystroke return
     end tell
     '''
-
-    subprocess.run(
+    result = subprocess.run(
         ["osascript", "-e", script],
         check=False,
-        capture_output=True
+        capture_output=True,
+        text=True,
     )
+    if result.returncode != 0 and result.stderr:
+        try:
+            from logger import log_error
+            log_error(f"press_enter osascript failed: {result.stderr.strip()}")
+        except ImportError:
+            pass
 
 
 def type_text_via_clipboard(text: str, target_app: str = None) -> None:
