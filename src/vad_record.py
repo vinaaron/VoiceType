@@ -219,13 +219,44 @@ def record_with_vad_streaming(
         None — the transcript lives in the Transcriber. Call
         moonshine_transcribe.finalize(transcriber) to extract it.
     """
+    import queue
+    import threading
+
     model = get_vad_model()
 
     audio_handle = pyaudio.PyAudio()
-    stream = None
+    pa_stream = None
+
+    # Producer-consumer queue: PyAudio loop pushes audio chunks here;
+    # a separate worker thread pulls them and feeds Moonshine. This
+    # decouples the (real-time) audio capture from the (60-140ms) ONNX
+    # inference that happens inside stream.add_audio(). Without this
+    # decoupling, PyAudio's small ring buffer overflows during each
+    # add_audio call and drops audio — which both truncates the
+    # transcript AND makes Silero see false silences.
+    feed_queue: "queue.Queue[bytes | None]" = queue.Queue(maxsize=64)
+    consumer_error = []
+
+    def consumer():
+        """Pull audio from the queue and feed Moonshine. Runs in its
+        own thread so the PyAudio loop never blocks on model inference."""
+        try:
+            while True:
+                item = feed_queue.get()
+                if item is None:
+                    return  # sentinel — drain complete
+                combined_float = (
+                    np.frombuffer(item, np.int16).astype(np.float32) / 32768.0
+                ).tolist()
+                stream.add_audio(combined_float, sample_rate=SAMPLE_RATE)
+        except Exception as e:
+            consumer_error.append(e)
+
+    consumer_thread = threading.Thread(target=consumer, daemon=True)
+    consumer_thread.start()
 
     try:
-        stream = audio_handle.open(
+        pa_stream = audio_handle.open(
             format=FORMAT,
             channels=CHANNELS,
             rate=SAMPLE_RATE,
@@ -235,31 +266,32 @@ def record_with_vad_streaming(
 
         # Warm-up: discard initial buffer garbage.
         for _ in range(3):
-            stream.read(CHUNK_SAMPLES, exception_on_overflow=False)
+            pa_stream.read(CHUNK_SAMPLES, exception_on_overflow=False)
 
         silence_chunks = 0
         chunks_for_silence = int(silence_duration * 1000 / CHUNK_MS)
         max_chunks = int(max_duration * 1000 / CHUNK_MS)
         speech_detected = False
 
-        # Buffer for batching small Silero chunks into larger feeds to
-        # Moonshine — each ONNX call has fixed overhead; ~320ms feeds
-        # amortise that without sacrificing perceived latency.
+        # Local buffer that batches CHUNK_SAMPLES-size PyAudio reads
+        # into ~320ms feeds. Stays small (≤chunks_per_feed entries).
         feed_buffer = []
 
-        def flush_feed():
+        def enqueue_feed():
             if not feed_buffer:
                 return
-            combined_int16 = np.concatenate(feed_buffer)
-            combined_float = (combined_int16.astype(np.float32) / 32768.0).tolist()
-            stream.add_audio(combined_float, sample_rate=SAMPLE_RATE)
+            combined_bytes = b"".join(f.tobytes() for f in feed_buffer)
+            try:
+                feed_queue.put(combined_bytes, timeout=1.0)
+            except queue.Full:
+                pass  # drop rather than block — better to lose audio than wedge
             feed_buffer.clear()
 
         for _ in range(max_chunks):
             if stop_event is not None and stop_event.is_set():
                 break
 
-            data = stream.read(CHUNK_SAMPLES, exception_on_overflow=False)
+            data = pa_stream.read(CHUNK_SAMPLES, exception_on_overflow=False)
             audio_int16 = np.frombuffer(data, np.int16)
             feed_buffer.append(audio_int16)
 
@@ -285,17 +317,22 @@ def record_with_vad_streaming(
                     if silence_chunks >= chunks_for_silence:
                         break
 
-            # Flush in real-time-sized batches to the transcriber.
+            # Hand off the batch to the consumer thread — non-blocking.
             if len(feed_buffer) >= chunks_per_feed:
-                flush_feed()
+                enqueue_feed()
 
         # Send any remaining buffered audio.
-        flush_feed()
+        enqueue_feed()
 
     finally:
-        if stream is not None:
-            stream.stop_stream()
-            stream.close()
+        if pa_stream is not None:
+            pa_stream.stop_stream()
+            pa_stream.close()
         audio_handle.terminate()
+        # Signal consumer to drain and exit, then wait for it.
+        feed_queue.put(None)
+        consumer_thread.join(timeout=3.0)
+        if consumer_error:
+            raise consumer_error[0]
 
     return None
