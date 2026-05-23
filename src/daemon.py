@@ -18,9 +18,11 @@ import json
 import os
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -48,6 +50,7 @@ _state_lock = threading.Lock()
 _current_session: "Session | None" = None
 _shutdown_event = threading.Event()
 _last_activity = time.monotonic()  # bumped each time a command arrives
+_transcript_history: deque = deque(maxlen=10)  # recent finished sessions for revert/replay
 
 
 class Session:
@@ -70,7 +73,16 @@ class Session:
 
     def _run(self):
         try:
-            run_voice_session(self.config, self.stop_event, models_preloaded=True)
+            result = run_voice_session(self.config, self.stop_event, models_preloaded=True)
+            if result.get("ok"):
+                with _state_lock:
+                    _transcript_history.append({
+                        "final": result.get("text", ""),
+                        "raw": result.get("raw", ""),
+                        "llm_mode": result.get("llm_mode"),
+                        "target_app": result.get("target_app"),
+                        "at": time.time(),
+                    })
         except Exception as e:
             log_error(f"session crashed: {e}")
             import traceback
@@ -140,9 +152,21 @@ def preload_models(config: dict) -> None:
         get_vad_model()
         log_stage("daemon_vad_ready")
 
+    mode = config.get("transcription_mode", "mlx")
+    if mode == "parakeet":
+        try:
+            from parakeet_transcribe import get_parakeet_model
+            get_parakeet_model(config.get("parakeet_model", "mlx-community/parakeet-tdt-0.6b-v3"))
+            log_stage("daemon_parakeet_ready")
+        except ImportError:
+            log_info("parakeet-mlx not installed; will fall back to Whisper at runtime")
+        except Exception as e:
+            log_error(f"Parakeet preload failed: {e}")
+        return  # don't also preload Whisper if Parakeet is the chosen mode
+
     # Pre-load MLX too if that's the transcription mode. This costs ~250MB
     # of RAM idle but makes transcription effectively instant.
-    if config.get("transcription_mode", "mlx") == "mlx":
+    if mode == "mlx":
         try:
             from mlx_transcribe import transcribe_with_mlx  # noqa: F401
             # The module-level cache in mlx_transcribe loads on first call,
@@ -169,6 +193,48 @@ def preload_models(config: dict) -> None:
             log_info("MLX not installed; transcription will cold-start on first use")
 
 
+def _last_transcript_entry() -> dict | None:
+    with _state_lock:
+        return _transcript_history[-1] if _transcript_history else None
+
+
+def _paste_text(text: str, target_app: str | None) -> None:
+    """Paste text via clipboard. Save/restore the user's clipboard."""
+    from output import type_text_via_clipboard
+    type_text_via_clipboard(text, target_app=target_app)
+
+
+def _backspace(n: int) -> None:
+    """Issue n Backspace keystrokes via AppleScript. Used by revert to
+    delete the just-pasted cleaned text before pasting the raw version."""
+    if n <= 0:
+        return
+    # System Events 'key code 51' = Delete (Backspace). We issue them in
+    # chunks of 50 so the AppleScript doesn't time out on very long pastes.
+    chunks = (n + 49) // 50
+    per_chunk = min(50, n)
+    remainder = n - chunks * 50 if n > chunks * 50 else 0
+    script_template = '''
+    tell application "System Events"
+        repeat {COUNT} times
+            key code 51
+        end repeat
+    end tell
+    '''
+    try:
+        for _ in range(chunks):
+            cnt = min(50, n)
+            n -= cnt
+            subprocess.run(
+                ["osascript", "-e", script_template.replace("{COUNT}", str(cnt))],
+                check=False, capture_output=True, timeout=3.0,
+            )
+            if n <= 0:
+                break
+    except Exception as e:
+        log_error(f"backspace failed: {e}")
+
+
 def handle_command(conn: socket.socket) -> None:
     global _current_session, _last_activity
     try:
@@ -193,6 +259,24 @@ def handle_command(conn: socket.socket) -> None:
         elif op == "status":
             recording = _current_session is not None and _current_session.alive()
             conn.sendall((json.dumps({"recording": recording}) + "\n").encode())
+        elif op == "replay":
+            entry = _last_transcript_entry()
+            if entry is None:
+                conn.sendall(b'{"error":"no recent transcript"}\n')
+            else:
+                _paste_text(entry["final"], entry.get("target_app"))
+                conn.sendall((json.dumps({"state": "replayed", "len": len(entry["final"])}) + "\n").encode())
+        elif op == "revert":
+            entry = _last_transcript_entry()
+            if entry is None:
+                conn.sendall(b'{"error":"no recent transcript"}\n')
+            elif not entry.get("raw") or entry["raw"] == entry["final"]:
+                conn.sendall(b'{"error":"last transcript had no LLM cleanup, nothing to revert"}\n')
+            else:
+                final_len = len(entry["final"])
+                _backspace(final_len)
+                _paste_text(entry["raw"], entry.get("target_app"))
+                conn.sendall((json.dumps({"state": "reverted", "removed": final_len}) + "\n").encode())
         elif op == "shutdown":
             conn.sendall(b'{"state":"shutting_down"}\n')
             _shutdown_event.set()
@@ -268,10 +352,20 @@ def idle_reaper(timeout_seconds: float) -> None:
                 continue  # active recording — don't yank the model out
         try:
             from mlx_transcribe import unload_mlx_model
-            if unload_mlx_model():
-                log_info(f"idle {int(idle)}s ≥ {int(timeout_seconds)}s — MLX model unloaded")
+            mlx_dropped = unload_mlx_model()
         except Exception as e:
-            log_error(f"idle reaper unload failed: {e}")
+            log_error(f"idle reaper MLX unload failed: {e}")
+            mlx_dropped = False
+        try:
+            from parakeet_transcribe import unload_parakeet_model
+            parakeet_dropped = unload_parakeet_model()
+        except Exception:
+            parakeet_dropped = False
+        if mlx_dropped or parakeet_dropped:
+            log_info(
+                f"idle {int(idle)}s ≥ {int(timeout_seconds)}s — "
+                f"models unloaded (mlx={mlx_dropped}, parakeet={parakeet_dropped})"
+            )
 
 
 def main() -> int:

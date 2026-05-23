@@ -19,6 +19,29 @@ from recording_indicator import show_recording_indicator, hide_recording_indicat
 from logger import log_stage, log_info, log_error
 
 
+_DICTIONARY_PATH = os.path.expanduser("~/.voice-cli/dictionary.txt")
+
+
+def load_personal_dictionary() -> str | None:
+    """Read ~/.voice-cli/dictionary.txt and turn it into a single
+    Whisper initial_prompt string. Lines starting with # are skipped.
+    Returns None if no dictionary or empty."""
+    if not os.path.exists(_DICTIONARY_PATH):
+        return None
+    try:
+        with open(_DICTIONARY_PATH) as f:
+            terms = [
+                line.strip() for line in f
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
+    except OSError:
+        return None
+    if not terms:
+        return None
+    # Whisper prompts work best as natural-sounding context, not bare lists.
+    return "Terms that may appear: " + ", ".join(terms) + "."
+
+
 def check_enter_trigger(text: str, triggers: list) -> tuple:
     text_stripped = text.rstrip(" .!?,;:")
     text_lower = text_stripped.lower()
@@ -143,10 +166,28 @@ def run_voice_session(
 
     log_info(f"transcribing mode={transcription_mode}")
 
-    if transcription_mode == "mlx":
+    initial_prompt = load_personal_dictionary()
+    if initial_prompt:
+        log_info(f"using personal dictionary ({initial_prompt.count(',') + 1} terms)")
+
+    if transcription_mode == "parakeet":
+        parakeet_model = config.get("parakeet_model", "mlx-community/parakeet-tdt-0.6b-v3")
+        try:
+            from parakeet_transcribe import transcribe_with_parakeet
+            text = transcribe_with_parakeet(audio_path, model_name=parakeet_model)
+        except ImportError as e:
+            log_error(f"parakeet-mlx not installed ({e}), falling back to MLX Whisper")
+            from mlx_transcribe import transcribe_with_mlx
+            text = transcribe_with_mlx(audio_path, model_name=model, initial_prompt=initial_prompt)
+        except Exception as e:
+            log_error(f"Parakeet failed: {e}, falling back to MLX Whisper")
+            from mlx_transcribe import transcribe_with_mlx
+            text = transcribe_with_mlx(audio_path, model_name=model, initial_prompt=initial_prompt)
+
+    elif transcription_mode == "mlx":
         try:
             from mlx_transcribe import transcribe_with_mlx
-            text = transcribe_with_mlx(audio_path, model_name=model)
+            text = transcribe_with_mlx(audio_path, model_name=model, initial_prompt=initial_prompt)
         except ImportError:
             log_info("MLX not available, falling back to local")
             from transcribe import Transcriber
@@ -193,11 +234,17 @@ def run_voice_session(
         from llm_refine import refine_text, check_llm_trigger, DEFAULT_LLM_TRIGGERS
         llm_triggers = config.get("llm_triggers") or DEFAULT_LLM_TRIGGERS
         text, llm_mode = check_llm_trigger(text, llm_triggers)
+        # Snapshot the pre-LLM-refine transcript (trigger phrase already
+        # stripped). This is what "Voice Revert" restores if the LLM
+        # over-edited.
+        raw_text = text
         if llm_mode:
             log_info(f"llm trigger detected mode={llm_mode}")
             if show_notify:
                 notify("Voice CLI", f"Refining for {llm_mode}...")
             text = refine_text(text, llm_mode, config)
+    else:
+        raw_text = text
 
     log_stage("llm_end")
 
@@ -233,4 +280,10 @@ def run_voice_session(
     except OSError:
         pass
 
-    return {"ok": True, "text": text}
+    return {
+        "ok": True,
+        "text": text,        # the version that was actually pasted
+        "raw": raw_text,     # pre-LLM-cleanup, for "Voice Revert"
+        "llm_mode": llm_mode,
+        "target_app": original_app,
+    }

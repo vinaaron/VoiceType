@@ -54,6 +54,7 @@ def get_mlx_model(model_name: str = "distil-medium.en"):
 def transcribe_with_mlx(
     audio_path: str,
     model_name: str = "distil-medium.en",
+    initial_prompt: str | None = None,
 ) -> str:
     """
     Transcribe audio using Lightning Whisper MLX.
@@ -61,6 +62,10 @@ def transcribe_with_mlx(
     Args:
         audio_path: Path to the audio file (WAV recommended)
         model_name: Model to use (see get_mlx_model for options)
+        initial_prompt: Optional context string passed to Whisper to bias
+                        transcription toward specific terms (project names,
+                        repos, jargon). Up to ~224 tokens; longer is
+                        truncated by the decoder.
 
     Returns:
         Transcribed text as a string
@@ -72,6 +77,13 @@ def transcribe_with_mlx(
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
     whisper = get_mlx_model(model_name)
-    result = whisper.transcribe(audio_path)
+    if initial_prompt:
+        try:
+            result = whisper.transcribe(audio_path, initial_prompt=initial_prompt)
+        except TypeError:
+            # Older lightning_whisper_mlx versions don't accept initial_prompt
+            result = whisper.transcribe(audio_path)
+    else:
+        result = whisper.transcribe(audio_path)
 
     return result.get('text', '').strip()

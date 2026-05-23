@@ -65,6 +65,26 @@ def copy_to_clipboard(text: str) -> None:
     process.communicate(text.encode("utf-8"))
 
 
+def read_clipboard() -> bytes:
+    """Return the current clipboard contents as bytes (binary-safe)."""
+    try:
+        result = subprocess.run(
+            ["pbpaste"], capture_output=True, timeout=1.0,
+        )
+        return result.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return b""
+
+
+def write_clipboard_bytes(data: bytes) -> None:
+    """Write raw bytes to the clipboard (binary-safe pbcopy)."""
+    try:
+        process = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+        process.communicate(data, timeout=1.0)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+
 def paste_from_clipboard() -> None:
     """
     Simulate Cmd+V keystroke to paste from clipboard.
@@ -103,8 +123,8 @@ def type_text_via_clipboard(text: str, target_app: str = None) -> None:
     """
     Type text into an application using the clipboard method.
 
-    This is more reliable than direct keystrokes when the target app
-    is not currently frontmost (e.g., when triggered from Raycast).
+    Saves the user's existing clipboard before pasting and restores it
+    after, so dictation doesn't clobber whatever was previously copied.
 
     Args:
         text: Text to type
@@ -113,17 +133,23 @@ def type_text_via_clipboard(text: str, target_app: str = None) -> None:
     if not text:
         return
 
-    # Copy to clipboard
+    saved_clipboard = read_clipboard()
+
     copy_to_clipboard(text)
 
-    # Activate target app if specified
     if target_app:
         activate_app(target_app)
         import time
         time.sleep(0.03)
 
-    # Paste
     paste_from_clipboard()
+
+    # Give the receiving app a beat to actually consume the paste before
+    # we swap the clipboard back. Without this, fast apps can see the
+    # restored content instead.
+    import time as _time
+    _time.sleep(0.15)
+    write_clipboard_bytes(saved_clipboard)
 
 
 def play_sound(sound_name: str = "Ping", blocking: bool = False) -> None:

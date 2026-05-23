@@ -72,6 +72,25 @@ To restart the daemon: `pkill -f "python -m daemon"`; next hotkey press
 will respawn it. To stop it without restart: send `{"op":"shutdown"}` over
 the socket.
 
+### Additional hotkeys (Raycast scripts)
+
+- `raycast/voice-toggle.sh` — start/stop a recording (the main hotkey)
+- `raycast/voice-replay.sh` — re-paste the most recent transcript (useful
+  when Cmd+V silently failed in some Electron field)
+- `raycast/voice-revert.sh` — delete the last LLM-cleaned transcript and
+  paste the pre-cleanup raw version (best-effort: assumes cursor is
+  still where the cleaned text ended)
+
+The replay/revert hotkeys only work while the daemon is running, since
+they read from in-memory transcript history (last 10 sessions).
+
+### Personal dictionary
+
+Drop one term per line in `~/.voice-cli/dictionary.txt` (project names,
+repos, weird jargon, people-names). The file is read each session and
+passed to Whisper as `initial_prompt`, which biases transcription toward
+those terms. Lines starting with `#` are ignored.
+
 ### Transcription Backends
 
 | Mode | Speed | Requires | Notes |

@@ -2,18 +2,24 @@
 """
 voice-cli-client — thin client that the hotkey actually runs.
 
-Sends {"op":"toggle"} to the daemon over a Unix socket. If the daemon
-is unreachable (not running yet, crashed, socket stale), spawns it in
-the background and falls back to direct bin/voice-cli for THIS press.
-The next press will reach the warmed daemon.
+Default: sends {"op":"toggle"} to the daemon to start/stop a recording.
+With --replay: re-pastes the most recent transcript (helpful when paste
+silently failed in some Electron field).
+With --revert: deletes the last cleaned transcript and pastes the raw
+version (the pre-LLM-refine text). Best-effort — assumes the cursor is
+still where the cleaned text ended.
+
+If the daemon is unreachable (not running yet, crashed, socket stale),
+spawns it in the background and falls back to direct bin/voice-cli for
+THIS press. The next press will reach the warmed daemon.
 """
 
+import argparse
 import json
 import os
 import socket
 import subprocess
 import sys
-import time
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
@@ -21,33 +27,32 @@ SRC_DIR = os.path.join(REPO_ROOT, "src")
 VOICE_CLI_BIN = os.path.join(SCRIPT_DIR, "voice-cli")
 
 SOCK_PATH = os.path.expanduser("~/.voice-cli/voice-cli.sock")
-CONNECT_TIMEOUT = 0.3  # seconds
+CONNECT_TIMEOUT = 0.3
+READ_TIMEOUT = 3.0  # paste/backspace ops take a moment
 
 
-def try_send_toggle() -> bool:
-    """Returns True if the daemon handled the toggle, False otherwise."""
+def try_send(op: str) -> tuple[bool, dict]:
+    """Returns (handled_by_daemon, reply_dict)."""
     if not os.path.exists(SOCK_PATH):
-        return False
+        return False, {}
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(CONNECT_TIMEOUT)
         s.connect(SOCK_PATH)
-        s.sendall(b'{"op":"toggle"}\n')
-        s.settimeout(2.0)
-        resp = s.recv(4096).decode("utf-8").strip()
+        s.sendall((json.dumps({"op": op}) + "\n").encode())
+        s.settimeout(READ_TIMEOUT)
+        resp = s.recv(8192).decode("utf-8").strip()
         s.close()
         try:
             data = json.loads(resp)
         except json.JSONDecodeError:
-            return False
-        # Either "recording" or "stopping" means the daemon owns this press.
-        return data.get("state") in ("recording", "stopping")
+            return False, {}
+        return True, data
     except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError):
-        return False
+        return False, {}
 
 
 def spawn_daemon_in_background() -> None:
-    """Fire-and-forget start of the daemon. Won't block this press."""
     env = os.environ.copy()
     env["PYTHONPATH"] = SRC_DIR + os.pathsep + env.get("PYTHONPATH", "")
     log_path = os.path.expanduser("~/.voice-cli/daemon.stderr.log")
@@ -60,23 +65,58 @@ def spawn_daemon_in_background() -> None:
                 stdout=logf,
                 stderr=logf,
                 stdin=subprocess.DEVNULL,
-                start_new_session=True,  # survives this client exit
+                start_new_session=True,
             )
     except Exception:
         pass
 
 
 def run_fallback() -> int:
-    """Run bin/voice-cli in this process. Used when the daemon isn't available."""
+    """Run bin/voice-cli in this process (slow but reliable)."""
     os.execv(sys.executable, [sys.executable, VOICE_CLI_BIN])
 
 
 def main() -> int:
-    if try_send_toggle():
+    parser = argparse.ArgumentParser(description="voice-cli client")
+    parser.add_argument("--replay", action="store_true",
+                        help="re-paste the most recent transcript")
+    parser.add_argument("--revert", action="store_true",
+                        help="delete the last cleaned transcript and paste the raw version")
+    args = parser.parse_args()
+
+    if args.replay:
+        op = "replay"
+    elif args.revert:
+        op = "revert"
+    else:
+        op = "toggle"
+
+    handled, reply = try_send(op)
+    if handled:
+        if "error" in reply:
+            # Surface daemon errors as notifications so the user sees them.
+            try:
+                sys.path.insert(0, SRC_DIR)
+                from output import notify
+                notify("Voice CLI", reply["error"])
+            except Exception:
+                pass
         return 0
 
-    # Daemon unreachable. Kick it off for the NEXT press, then handle THIS
-    # press the slow way.
+    # Daemon unreachable.
+    if op != "toggle":
+        # Revert/replay only make sense against the daemon's memory. If the
+        # daemon isn't running, there's nothing to revert/replay anyway.
+        try:
+            sys.path.insert(0, SRC_DIR)
+            from output import notify
+            notify("Voice CLI", "Daemon not running — start it with a normal hotkey press first")
+        except Exception:
+            pass
+        spawn_daemon_in_background()
+        return 1
+
+    # First toggle of session — auto-spawn daemon for next time, run direct now.
     spawn_daemon_in_background()
     return run_fallback()
 

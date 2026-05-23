@@ -165,11 +165,15 @@ def record_with_vad(
             stream.close()
         audio.terminate()
 
-    # Save to WAV file
+    # Pad with 1s of silence at the end. Whisper hallucinates phrases like
+    # "Thanks for watching!" when audio ends abruptly; trailing silence
+    # gives the decoder a clean stop and dramatically reduces ghost text.
+    silence_padding = b"\x00\x00" * SAMPLE_RATE  # 1s of int16 zeros
+
     with wave.open(output_path, 'wb') as wf:
         wf.setnchannels(CHANNELS)
         wf.setsampwidth(audio.get_sample_size(FORMAT))
         wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(b''.join(frames))
+        wf.writeframes(b''.join(frames) + silence_padding)
 
     return output_path
