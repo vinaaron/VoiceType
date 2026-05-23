@@ -28,7 +28,9 @@ final class HUDWindow {
     init(viewModel: HUDViewModel) {
         self.viewModel = viewModel
 
-        let size = NSSize(width: 160, height: 160)
+        // Panel is sized to fit BlobView's outer frame (pillSize + breathing room).
+        // Keep this in sync with BlobView.pillSize + 12 to prevent edge clipping.
+        let size = NSSize(width: 108, height: 108)
         panel = NSPanel(
             contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.nonactivatingPanel, .borderless],
@@ -47,8 +49,13 @@ final class HUDWindow {
         panel.titlebarAppearsTransparent = true
         panel.alphaValue = 0
 
+        // NSHostingView defaults to opaque on some macOS versions — force
+        // its backing layer transparent so we only see the SwiftUI content
+        // (the glass pill draws its own translucent background).
         let host = NSHostingView(rootView: BlobView(viewModel: viewModel))
         host.frame = NSRect(origin: .zero, size: size)
+        host.wantsLayer = true
+        host.layer?.backgroundColor = .clear
         panel.contentView = host
     }
 
