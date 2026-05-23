@@ -119,6 +119,100 @@ def run_voice_session(
         if indicator:
             indicator.update_level(level)
 
+    # === Streaming path: Moonshine v2 ===
+    # When transcription_mode is "moonshine" we bypass the WAV-then-batch
+    # pipeline entirely. Audio is fed into the model as it's recorded, so
+    # the final transcript is ready ~150ms after end-of-speech regardless
+    # of utterance length.
+    if transcription_mode == "moonshine" and use_vad:
+        try:
+            from moonshine_transcribe import get_moonshine_model, reset_stream, finalize
+            from vad_record import record_with_vad_streaming
+            transcriber = get_moonshine_model(config)
+            reset_stream(transcriber)
+            try:
+                record_with_vad_streaming(
+                    transcriber,
+                    silence_duration=silence_duration,
+                    max_duration=max_duration,
+                    speech_threshold=vad_threshold,
+                    on_audio_level=on_audio_level if show_indicator else None,
+                    stop_event=stop_event,
+                )
+            finally:
+                if indicator:
+                    hide_recording_indicator(indicator)
+
+            log_stage("record_end")
+            if use_sound:
+                play_sound("Pop")
+
+            text = finalize(transcriber)
+            log_stage("transcribe_end")
+
+            if not text:
+                if show_notify:
+                    notify("Voice CLI", "No speech detected")
+                log_info("moonshine: empty transcript")
+                return {"ok": False, "reason": "no_speech"}
+
+            # Post-transcribe (number conversion → LLM refine → enter trigger → paste).
+            # Same shape as the batch path below, but inlined for clarity since
+            # the streaming path has no WAV/file_size book-keeping.
+            if convert_nums:
+                from number_words import convert_number_words
+                text = convert_number_words(text)
+
+            llm_mode = None
+            if use_llm:
+                from llm_refine import refine_text, check_llm_trigger, DEFAULT_LLM_TRIGGERS
+                llm_triggers = config.get("llm_triggers") or DEFAULT_LLM_TRIGGERS
+                text, llm_mode = check_llm_trigger(text, llm_triggers)
+                raw_text = text
+                if llm_mode:
+                    log_info(f"llm trigger detected mode={llm_mode}")
+                    if show_notify:
+                        notify("Voice CLI", f"Refining for {llm_mode}...")
+                    text = refine_text(text, llm_mode, config)
+            else:
+                raw_text = text
+
+            log_stage("llm_end")
+
+            should_enter = False
+            if auto_enter:
+                text, should_enter = check_enter_trigger(text, enter_triggers)
+
+            log_info(f"transcript={text!r} should_enter={should_enter} target_app={original_app}")
+
+            if debug:
+                print(f"Transcribed (moonshine): {text}")
+            else:
+                if text:
+                    type_text_via_clipboard(text, target_app=original_app)
+                if should_enter:
+                    time.sleep(0.05)
+                    press_enter()
+                if show_notify:
+                    action = "Sent" if should_enter else "Typed"
+                    notify("Voice CLI", f"{action}: {text[:50]}...")
+
+            log_stage("paste_done")
+            return {
+                "ok": True,
+                "text": text,
+                "raw": raw_text,
+                "llm_mode": llm_mode,
+                "target_app": original_app,
+            }
+        except ImportError as e:
+            log_error(f"moonshine not available ({e}), falling back to batch MLX")
+        except Exception as e:
+            log_error(f"moonshine streaming failed: {e}, falling back to batch MLX")
+            import traceback
+            traceback.print_exc()
+
+    # === Batch path: MLX Whisper / Groq / Parakeet ===
     try:
         if use_vad:
             from vad_record import record_with_vad

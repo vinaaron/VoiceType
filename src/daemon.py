@@ -153,6 +153,17 @@ def preload_models(config: dict) -> None:
         log_stage("daemon_vad_ready")
 
     mode = config.get("transcription_mode", "mlx")
+    if mode == "moonshine":
+        try:
+            from moonshine_transcribe import get_moonshine_model
+            get_moonshine_model(config)
+            log_stage("daemon_moonshine_ready")
+        except ImportError:
+            log_info("moonshine-voice not installed; will fall back to MLX at runtime")
+        except Exception as e:
+            log_error(f"Moonshine preload failed: {e}")
+        return  # streaming model is what we'll use; skip Whisper preload
+
     if mode == "parakeet":
         try:
             from parakeet_transcribe import get_parakeet_model
@@ -361,10 +372,15 @@ def idle_reaper(timeout_seconds: float) -> None:
             parakeet_dropped = unload_parakeet_model()
         except Exception:
             parakeet_dropped = False
-        if mlx_dropped or parakeet_dropped:
+        try:
+            from moonshine_transcribe import unload_moonshine_model
+            moonshine_dropped = unload_moonshine_model()
+        except Exception:
+            moonshine_dropped = False
+        if mlx_dropped or parakeet_dropped or moonshine_dropped:
             log_info(
                 f"idle {int(idle)}s ≥ {int(timeout_seconds)}s — "
-                f"models unloaded (mlx={mlx_dropped}, parakeet={parakeet_dropped})"
+                f"models unloaded (mlx={mlx_dropped}, parakeet={parakeet_dropped}, moonshine={moonshine_dropped})"
             )
 
 

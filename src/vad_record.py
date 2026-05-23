@@ -177,3 +177,124 @@ def record_with_vad(
         wf.writeframes(b''.join(frames) + silence_padding)
 
     return output_path
+
+
+def record_with_vad_streaming(
+    transcriber,
+    silence_duration=2.0,
+    max_duration=30,
+    speech_threshold=0.5,
+    on_audio_level=None,
+    stop_event=None,
+    chunks_per_feed=10,
+):
+    """
+    Streaming counterpart to record_with_vad().
+
+    Records via PyAudio + Silero VAD (same gate semantics as record_with_vad),
+    but instead of accumulating frames and writing a WAV at the end, this
+    function pushes audio chunks directly into a Moonshine `Transcriber`
+    as they arrive — so the model processes audio while the user is still
+    speaking and the final transcript is ready ~150ms after end-of-speech
+    regardless of utterance length.
+
+    Args:
+        transcriber: A live moonshine_voice.Transcriber instance (already
+                     started, warmed up). The caller owns its lifecycle
+                     and reads the final transcript via
+                     moonshine_transcribe.finalize(tx) after this returns.
+        silence_duration: Seconds of post-speech silence before stopping.
+        max_duration: Safety cap in seconds.
+        speech_threshold: VAD confidence threshold (0-1).
+        on_audio_level: Optional callback(level∈[0,1]) for VU meter.
+        stop_event: threading.Event — when set, recording ends early
+                    (used by the SIGUSR1 / socket toggle).
+        chunks_per_feed: How many 32ms Silero chunks to buffer before
+                         each transcriber.add_audio call. Amortizes the
+                         per-call ONNX overhead. Default 10 ≈ 320ms.
+
+    Returns:
+        None — the transcript lives in the Transcriber. Call
+        moonshine_transcribe.finalize(transcriber) to extract it.
+    """
+    model = get_vad_model()
+
+    audio_handle = pyaudio.PyAudio()
+    stream = None
+
+    try:
+        stream = audio_handle.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=SAMPLE_RATE,
+            input=True,
+            frames_per_buffer=CHUNK_SAMPLES,
+        )
+
+        # Warm-up: discard initial buffer garbage.
+        for _ in range(3):
+            stream.read(CHUNK_SAMPLES, exception_on_overflow=False)
+
+        silence_chunks = 0
+        chunks_for_silence = int(silence_duration * 1000 / CHUNK_MS)
+        max_chunks = int(max_duration * 1000 / CHUNK_MS)
+        speech_detected = False
+
+        # Buffer for batching small Silero chunks into larger feeds to
+        # Moonshine — each ONNX call has fixed overhead; ~320ms feeds
+        # amortise that without sacrificing perceived latency.
+        feed_buffer = []
+
+        def flush_feed():
+            if not feed_buffer:
+                return
+            # Concatenate, convert to float32 list, feed to transcriber.
+            combined_int16 = np.concatenate(feed_buffer)
+            combined_float = (combined_int16.astype(np.float32) / 32768.0).tolist()
+            transcriber.add_audio(combined_float, sample_rate=SAMPLE_RATE)
+            feed_buffer.clear()
+
+        for _ in range(max_chunks):
+            if stop_event is not None and stop_event.is_set():
+                break
+
+            data = stream.read(CHUNK_SAMPLES, exception_on_overflow=False)
+            audio_int16 = np.frombuffer(data, np.int16)
+            feed_buffer.append(audio_int16)
+
+            if on_audio_level:
+                rms = np.sqrt(np.mean(audio_int16.astype(np.float32) ** 2))
+                if rms > 1:
+                    normalized = min(1.0, (np.log10(rms) + 1) / 3)
+                else:
+                    normalized = 0.0
+                on_audio_level(normalized)
+
+            # VAD decision (same Silero pipeline as the batch path).
+            audio_float32 = int2float(audio_int16)
+            tensor = torch.from_numpy(audio_float32)
+            speech_prob = model(tensor, SAMPLE_RATE).item()
+
+            if speech_prob >= speech_threshold:
+                speech_detected = True
+                silence_chunks = 0
+            else:
+                if speech_detected:
+                    silence_chunks += 1
+                    if silence_chunks >= chunks_for_silence:
+                        break
+
+            # Flush in real-time-sized batches to the transcriber.
+            if len(feed_buffer) >= chunks_per_feed:
+                flush_feed()
+
+        # Send any remaining buffered audio.
+        flush_feed()
+
+    finally:
+        if stream is not None:
+            stream.stop_stream()
+            stream.close()
+        audio_handle.terminate()
+
+    return None

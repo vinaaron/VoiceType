@@ -76,6 +76,7 @@ echo "[4/7] Installing Python dependencies..."
 "$VENV_DIR/bin/pip" install --upgrade pip --quiet
 "$VENV_DIR/bin/pip" install -r "$SCRIPT_DIR/requirements.txt" --quiet
 "$VENV_DIR/bin/pip" install rumps --quiet
+"$VENV_DIR/bin/pip" install moonshine-voice --quiet
 
 # Download faster-whisper model and Silero VAD
 echo "[5/7] Downloading models (Whisper + Silero VAD)..."
