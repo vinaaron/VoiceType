@@ -53,6 +53,7 @@ def record_with_vad(
     max_duration=30,
     speech_threshold=0.5,
     on_audio_level=None,
+    stop_event=None,
 ):
     """
     Record audio until user stops speaking.
@@ -68,6 +69,9 @@ def record_with_vad(
         speech_threshold: VAD confidence threshold 0-1 (default: 0.5)
         on_audio_level: Optional callback(level) for real-time audio visualization.
                         Level is normalized 0-1 based on RMS.
+        stop_event: Optional threading.Event. When set, the recording loop
+                    breaks early and the partial audio is saved. Used to
+                    implement second-press toggle ("stop & transcribe now").
 
     Returns:
         Path to recorded audio file
@@ -113,6 +117,9 @@ def record_with_vad(
         speech_detected = False
 
         for _ in range(max_chunks):
+            if stop_event is not None and stop_event.is_set():
+                break
+
             # Read audio chunk
             data = stream.read(CHUNK_SAMPLES, exception_on_overflow=False)
             frames.append(data)

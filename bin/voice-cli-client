@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""
+voice-cli-client — thin client that the hotkey actually runs.
+
+Sends {"op":"toggle"} to the daemon over a Unix socket. If the daemon
+is unreachable (not running yet, crashed, socket stale), spawns it in
+the background and falls back to direct bin/voice-cli for THIS press.
+The next press will reach the warmed daemon.
+"""
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+SRC_DIR = os.path.join(REPO_ROOT, "src")
+VOICE_CLI_BIN = os.path.join(SCRIPT_DIR, "voice-cli")
+
+SOCK_PATH = os.path.expanduser("~/.voice-cli/voice-cli.sock")
+CONNECT_TIMEOUT = 0.3  # seconds
+
+
+def try_send_toggle() -> bool:
+    """Returns True if the daemon handled the toggle, False otherwise."""
+    if not os.path.exists(SOCK_PATH):
+        return False
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(CONNECT_TIMEOUT)
+        s.connect(SOCK_PATH)
+        s.sendall(b'{"op":"toggle"}\n')
+        s.settimeout(2.0)
+        resp = s.recv(4096).decode("utf-8").strip()
+        s.close()
+        try:
+            data = json.loads(resp)
+        except json.JSONDecodeError:
+            return False
+        # Either "recording" or "stopping" means the daemon owns this press.
+        return data.get("state") in ("recording", "stopping")
+    except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError):
+        return False
+
+
+def spawn_daemon_in_background() -> None:
+    """Fire-and-forget start of the daemon. Won't block this press."""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = SRC_DIR + os.pathsep + env.get("PYTHONPATH", "")
+    log_path = os.path.expanduser("~/.voice-cli/daemon.stderr.log")
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    try:
+        with open(log_path, "ab") as logf:
+            subprocess.Popen(
+                [sys.executable, "-m", "daemon"],
+                env=env,
+                stdout=logf,
+                stderr=logf,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,  # survives this client exit
+            )
+    except Exception:
+        pass
+
+
+def run_fallback() -> int:
+    """Run bin/voice-cli in this process. Used when the daemon isn't available."""
+    os.execv(sys.executable, [sys.executable, VOICE_CLI_BIN])
+
+
+def main() -> int:
+    if try_send_toggle():
+        return 0
+
+    # Daemon unreachable. Kick it off for the NEXT press, then handle THIS
+    # press the slow way.
+    spawn_daemon_in_background()
+    return run_fallback()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

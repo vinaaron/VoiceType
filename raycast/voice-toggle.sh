@@ -16,17 +16,9 @@
 
 # Use absolute paths (~ might not expand correctly in all contexts)
 VENV_PYTHON="/Users/avini/.voice-cli-venv/bin/python"
-VOICE_CLI="/Users/avini/Documents/GitHub/voice-cli/bin/voice-cli"
-LOG_FILE="/Users/avini/.voice-cli/raycast.log"
+CLIENT="/Users/avini/Documents/GitHub/voice-cli/bin/voice-cli-client"
 
-# Log start time
-echo "=== $(date) ===" >> "$LOG_FILE"
-echo "Starting voice-cli from Raycast" >> "$LOG_FILE"
-
-# Run voice-cli (stderr goes to log, stdout is silent in normal mode)
-"$VENV_PYTHON" "$VOICE_CLI" 2>> "$LOG_FILE"
-EXIT_CODE=$?
-
-# Log completion
-echo "Exit code: $EXIT_CODE" >> "$LOG_FILE"
-echo "" >> "$LOG_FILE"
+# Fast path: client talks to the daemon over a Unix socket. If the daemon
+# isn't up, the client transparently spawns it in the background and falls
+# back to direct invocation for this press. Subsequent presses are fast.
+"$VENV_PYTHON" "$CLIENT" 2>>"$HOME/.voice-cli/raycast.log"

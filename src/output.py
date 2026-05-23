@@ -119,69 +119,11 @@ def type_text_via_clipboard(text: str, target_app: str = None) -> None:
     # Activate target app if specified
     if target_app:
         activate_app(target_app)
-        # Small delay to ensure app is frontmost
         import time
-        time.sleep(0.1)
+        time.sleep(0.03)
 
     # Paste
     paste_from_clipboard()
-
-
-def type_text(text: str) -> None:
-    """
-    Type text into the frontmost application using osascript.
-
-    This simulates keyboard input, so the text will appear wherever
-    the cursor is currently focused.
-
-    Args:
-        text: The text to type
-
-    Raises:
-        subprocess.CalledProcessError: If osascript fails
-    """
-    if not text:
-        return
-
-    # Escape special characters for AppleScript string
-    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
-
-    script = f'''
-    tell application "System Events"
-        keystroke "{escaped}"
-    end tell
-    '''
-
-    subprocess.run(
-        ["osascript", "-e", script],
-        check=True,
-        capture_output=True
-    )
-
-
-def type_text_with_return(text: str) -> None:
-    """
-    Type text and press Return/Enter at the end.
-
-    Useful for submitting commands directly.
-    """
-    if not text:
-        return
-
-    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
-
-    script = f'''
-    tell application "System Events"
-        keystroke "{escaped}"
-        keystroke return
-    end tell
-    '''
-
-    subprocess.run(
-        ["osascript", "-e", script],
-        check=True,
-        capture_output=True
-    )
 
 
 def play_sound(sound_name: str = "Ping", blocking: bool = False) -> None:
@@ -212,20 +154,27 @@ def play_sound(sound_name: str = "Ping", blocking: bool = False) -> None:
             )
 
 
+_TERMINAL_NOTIFIER = "/opt/homebrew/bin/terminal-notifier"
+
+
 def notify(title: str, message: str) -> None:
     """
     Show a macOS notification.
 
-    Args:
-        title: Notification title
-        message: Notification body text
+    Prefers terminal-notifier (clickable, dismissable, no AppleScript stall)
+    when present; falls back to osascript display notification.
     """
-    script = f'''
-    display notification "{message}" with title "{title}"
-    '''
+    if os.path.exists(_TERMINAL_NOTIFIER):
+        subprocess.Popen(
+            [_TERMINAL_NOTIFIER, "-title", title, "-message", message, "-group", "voice-cli"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return
 
+    script = f'display notification "{message}" with title "{title}"'
     subprocess.run(
         ["osascript", "-e", script],
         check=False,
-        capture_output=True
+        capture_output=True,
     )

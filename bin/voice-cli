@@ -1,139 +1,149 @@
 #!/usr/bin/env python3
 """
-Voice CLI - Voice-to-text for Claude Code terminal sessions.
+Voice CLI - Voice-to-text for Claude Code terminal sessions (one-shot mode).
 
-Usage:
-    voice-cli              # Record until silence, transcribe, type result
-    voice-cli --no-sound   # Disable audio feedback
-    voice-cli --no-numbers # Disable number word conversion
-    voice-cli --model small.en  # Use a different model
+This is the fallback / direct-invocation entrypoint. The fast path goes
+through bin/voice-cli-client → src/daemon.py (which keeps models warm).
+This script is what runs when the daemon is unreachable.
+
+Second press of the hotkey while a recording is in progress sends SIGUSR1
+to the running instance, which stops recording immediately and transcribes
+whatever was captured so far.
 """
 
-import sys
-import os
 import argparse
-import fcntl
+import atexit
+import os
+import signal
+import subprocess
+import sys
+import threading
 
-# Add src directory to path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SRC_DIR = os.path.join(os.path.dirname(SCRIPT_DIR), "src")
 sys.path.insert(0, SRC_DIR)
 
-# Load environment variables from .env file (if exists)
-# Checks project root first, then ~/.voice-cli/
 try:
     from dotenv import load_dotenv
-    env_paths = [
-        os.path.join(os.path.dirname(SCRIPT_DIR), ".env"),  # Project root
-        os.path.expanduser("~/.voice-cli/.env"),            # User config dir
-    ]
-    for env_path in env_paths:
+    for env_path in [
+        os.path.join(os.path.dirname(SCRIPT_DIR), ".env"),
+        os.path.expanduser("~/.voice-cli/.env"),
+    ]:
         if os.path.exists(env_path):
             load_dotenv(env_path)
             break
 except ImportError:
-    pass  # python-dotenv not installed, continue without it
+    pass
 
-from record import record_with_silence_detection, record_fixed_duration
-from vad_record import record_with_vad
-from transcribe import Transcriber
-from number_words import convert_number_words
-from output import (
-    type_text, type_text_via_clipboard, play_sound, notify,
-    get_frontmost_app, press_enter
-)
-from recording_indicator import show_recording_indicator, hide_recording_indicator
-from llm_refine import refine_text, check_llm_trigger, DEFAULT_LLM_TRIGGERS
+from logger import get_logger, log_stage, log_info, log_error
+from session import run_voice_session
 
-# Lock file to prevent concurrent recordings
-LOCK_FILE = os.path.expanduser("~/.voice-cli/voice-cli.lock")
+PID_FILE = os.path.expanduser("~/.voice-cli/voice-cli.pid")
+
+stop_requested = threading.Event()
 
 
-def acquire_lock():
-    """Try to acquire exclusive lock. Returns file handle or None if already locked."""
-    os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
-    lock_fd = open(LOCK_FILE, 'w')
+def _handle_stop_signal(signum, frame):
+    stop_requested.set()
+
+
+def write_pidfile() -> None:
+    os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+
+def sweep_orphan_indicators() -> None:
+    """Kill any leftover menu_bar_indicator subprocesses from prior crashed runs."""
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return lock_fd
-    except BlockingIOError:
-        lock_fd.close()
-        return None
+        subprocess.run(
+            ["pkill", "-9", "-f", "menu_bar_indicator"],
+            check=False, capture_output=True,
+        )
+    except FileNotFoundError:
+        pass
 
 
-def release_lock(lock_fd):
-    """Release the lock."""
-    if lock_fd:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        lock_fd.close()
+def remove_pidfile() -> None:
+    try:
+        if os.path.exists(PID_FILE):
+            with open(PID_FILE) as f:
+                pid = int(f.read().strip() or "0")
+            if pid == os.getpid():
+                os.remove(PID_FILE)
+    except (OSError, ValueError):
+        pass
 
 
-def check_enter_trigger(text: str, triggers: list) -> tuple:
-    """
-    Check if text ends with an enter trigger word.
+def signal_running_instance_or_claim() -> bool:
+    if not os.path.exists(PID_FILE):
+        write_pidfile()
+        return False
 
-    Args:
-        text: The transcribed text
-        triggers: List of trigger words (e.g., ["enter", "send"])
+    try:
+        with open(PID_FILE) as f:
+            other_pid = int(f.read().strip() or "0")
+    except (OSError, ValueError):
+        other_pid = 0
 
-    Returns:
-        Tuple of (cleaned_text, should_enter)
-        - cleaned_text: Text with trigger word removed if found
-        - should_enter: True if trigger word was found
-    """
-    # Strip trailing punctuation BEFORE checking for triggers
-    # Whisper often adds periods, exclamation marks, etc.
-    text_stripped = text.rstrip(" .!?,;:")
-    text_lower = text_stripped.lower()
+    if other_pid <= 0 or other_pid == os.getpid():
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
+        write_pidfile()
+        return False
 
-    for trigger in triggers:
-        # Check if text ends with trigger word
-        if text_lower.endswith(trigger):
-            # Make sure it's a word boundary (space or start of string before trigger)
-            prefix = text_lower[:-len(trigger)]
-            if prefix == "" or prefix.endswith(" "):
-                # Remove trigger from original (preserving case in prefix)
-                cleaned = text_stripped[:len(prefix)].rstrip()
-                return (cleaned, True)
+    try:
+        os.kill(other_pid, 0)
+    except ProcessLookupError:
+        log_info(f"clearing stale pidfile pid={other_pid}")
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
+        write_pidfile()
+        return False
+    except PermissionError:
+        pass
 
-    return (text, False)
+    try:
+        os.kill(other_pid, signal.SIGUSR1)
+        log_info(f"toggle: sent SIGUSR1 to running instance pid={other_pid}")
+    except OSError as e:
+        log_error(f"failed to signal running instance pid={other_pid}: {e}")
+    return True
 
 
 def load_config():
-    """
-    Load configuration from ~/.voice-cli/config.yaml (preferred) or config.json.
-    Falls back to defaults if no config exists or parsing fails.
-    """
     import json
     config_dir = os.path.expanduser("~/.voice-cli")
     yaml_path = os.path.join(config_dir, "config.yaml")
     json_path = os.path.join(config_dir, "config.json")
 
     defaults = {
-        "model": "distil-medium.en",  # MLX model (distil-small.en, distil-medium.en, distil-large-v3)
-        "transcription_mode": "mlx",  # "mlx" (fast local), "groq" (cloud), "local" (slower fallback)
-        "groq_api_key": None,  # Required for groq mode (or set GROQ_API_KEY env var)
-        "silence_duration": 3.0,  # Seconds of silence before stopping (allows thinking pauses)
-        "silence_threshold": "1%",  # Fallback for sox (background <1%, speech ~4%)
+        "model": "distil-medium.en",
+        "transcription_mode": "mlx",
+        "groq_api_key": None,
+        "silence_duration": 1.2,
+        "silence_threshold": "1%",
         "sound_feedback": True,
         "convert_numbers": True,
-        "show_notifications": True,  # Visual feedback via macOS notifications
-        "show_recording_indicator": True,  # Show visual indicator during recording
-        "vad_mode": True,  # Use Silero VAD for intelligent speech detection (recommended)
-        "vad_threshold": 0.5,  # VAD confidence threshold (0-1)
-        "max_duration": 300,  # Safety cap (5 min) - rarely hit, silence detection stops recording
-        "duration": 5.0,  # Fallback fixed duration
-        "auto_enter": True,  # Press Enter when trigger words detected at end
-        "enter_triggers": ["enter", "send", "submit", "return"],  # Words that trigger Enter
-        # LLM refinement settings
-        "llm_refinement": True,  # Enable LLM-powered prompt refinement
-        "llm_backend": "groq",  # "groq" or "ollama"
-        "llm_model": "llama-3.3-70b-versatile",  # Model for refinement
-        "ollama_url": "http://localhost:11434",  # Ollama server URL
-        "llm_triggers": None,  # Use DEFAULT_LLM_TRIGGERS if not set
+        "show_notifications": True,
+        "show_recording_indicator": True,
+        "vad_mode": True,
+        "vad_threshold": 0.5,
+        "max_duration": 300,
+        "duration": 5.0,
+        "auto_enter": True,
+        "enter_triggers": ["enter", "send", "submit", "return"],
+        "llm_refinement": True,
+        "llm_backend": "groq",
+        "llm_model": "llama-3.3-70b-versatile",
+        "ollama_url": "http://localhost:11434",
+        "llm_triggers": None,
     }
 
-    # Try YAML first (preferred for human-readable config with comments)
     if os.path.exists(yaml_path):
         try:
             import yaml
@@ -141,328 +151,84 @@ def load_config():
                 user_config = yaml.safe_load(f) or {}
             defaults.update(user_config)
             return defaults
-        except ImportError:
-            pass  # YAML not available, try JSON
         except Exception:
-            pass  # Invalid YAML, try JSON
+            pass
 
-    # Fall back to JSON
     if os.path.exists(json_path):
         try:
             with open(json_path) as f:
                 user_config = json.load(f) or {}
             defaults.update(user_config)
         except Exception:
-            pass  # Invalid JSON, use defaults
+            pass
 
     return defaults
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Voice-to-text for terminal sessions"
-    )
-    parser.add_argument(
-        "--no-sound",
-        action="store_true",
-        help="Disable audio feedback (Ping/Pop sounds)"
-    )
-    parser.add_argument(
-        "--no-numbers",
-        action="store_true",
-        help="Disable number word to digit conversion"
-    )
-    parser.add_argument(
-        "--model",
-        default=None,
-        help="Whisper model to use (default: distil-medium.en for MLX)"
-    )
-    parser.add_argument(
-        "--mode",
-        default=None,
-        choices=["mlx", "groq", "local"],
-        help="Transcription mode: mlx (fast local), groq (cloud), local (slower fallback)"
-    )
-    parser.add_argument(
-        "--duration",
-        type=float,
-        default=5.0,
-        help="Recording duration in seconds (default: 5)"
-    )
-    parser.add_argument(
-        "--no-vad",
-        action="store_true",
-        help="Disable Silero VAD, use fixed duration recording instead"
-    )
-    parser.add_argument(
-        "--silence",
-        type=float,
-        default=None,
-        help="Silence duration before stopping (seconds)"
-    )
-    parser.add_argument(
-        "--vad-threshold",
-        type=float,
-        default=None,
-        help="VAD speech confidence threshold (0-1, default: 0.5)"
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Print debug information instead of typing"
-    )
-    parser.add_argument(
-        "--no-notify",
-        action="store_true",
-        help="Disable macOS notification popups"
-    )
-    parser.add_argument(
-        "--no-enter",
-        action="store_true",
-        help="Disable auto-enter trigger words (send, enter, etc.)"
-    )
-    parser.add_argument(
-        "--no-llm",
-        action="store_true",
-        help="Disable LLM refinement (for claude, for chatgpt triggers)"
-    )
-
+    parser = argparse.ArgumentParser(description="Voice-to-text for terminal sessions")
+    parser.add_argument("--no-sound", action="store_true")
+    parser.add_argument("--no-numbers", action="store_true")
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--mode", default=None, choices=["mlx", "groq", "local"])
+    parser.add_argument("--duration", type=float, default=5.0)
+    parser.add_argument("--no-vad", action="store_true")
+    parser.add_argument("--silence", type=float, default=None)
+    parser.add_argument("--vad-threshold", type=float, default=None)
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--no-notify", action="store_true")
+    parser.add_argument("--no-enter", action="store_true")
+    parser.add_argument("--no-llm", action="store_true")
     args = parser.parse_args()
 
-    # Load config and override with CLI args
+    get_logger(debug=args.debug)
+    log_stage("start")
+
     config = load_config()
+    # CLI overrides
+    if args.model: config["model"] = args.model
+    if args.mode: config["transcription_mode"] = args.mode
+    if args.duration: config["duration"] = args.duration
+    if args.silence is not None: config["silence_duration"] = args.silence
+    if args.vad_threshold is not None: config["vad_threshold"] = args.vad_threshold
+    if args.no_sound: config["sound_feedback"] = False
+    if args.no_numbers: config["convert_numbers"] = False
+    if args.no_notify: config["show_notifications"] = False
+    if args.no_vad: config["vad_mode"] = False
+    if args.no_enter: config["auto_enter"] = False
+    if args.no_llm: config["llm_refinement"] = False
 
-    model = args.model or config["model"]
-    transcription_mode = args.mode or config.get("transcription_mode", "mlx")
-    groq_api_key = config.get("groq_api_key") or os.environ.get("GROQ_API_KEY")
-    duration = args.duration or config.get("duration", 5.0)
-    silence_duration = args.silence or config["silence_duration"]
-    use_sound = not args.no_sound and config["sound_feedback"]
-    convert_nums = not args.no_numbers and config["convert_numbers"]
-    show_notify = not args.no_notify and config.get("show_notifications", True)
-    show_indicator = config.get("show_recording_indicator", True)
-    use_vad = not args.no_vad and config.get("vad_mode", True)
-    vad_threshold = args.vad_threshold or config.get("vad_threshold", 0.5)
-    max_duration = config.get("max_duration", 30)
-    auto_enter = not args.no_enter and config.get("auto_enter", True)
-    enter_triggers = config.get("enter_triggers", ["enter", "send", "submit", "return"])
-    use_llm = not args.no_llm and config.get("llm_refinement", True)
-    llm_triggers = config.get("llm_triggers") or DEFAULT_LLM_TRIGGERS
-
-    # Try to acquire lock (prevent concurrent recordings)
-    lock_fd = acquire_lock()
-    if lock_fd is None:
-        if show_notify:
-            notify("Voice CLI", "Recording already in progress")
-        if args.debug:
-            print("Another recording is already in progress")
+    if signal_running_instance_or_claim():
         return
 
+    sweep_orphan_indicators()
+    atexit.register(remove_pidfile)
+    signal.signal(signal.SIGUSR1, _handle_stop_signal)
+
     try:
-        # IMPORTANT: Save frontmost app BEFORE anything else
-        # This is needed because Raycast may become frontmost when triggered
-        original_app = get_frontmost_app()
-        if args.debug:
-            print(f"Frontmost app at start: {original_app}")
-
-        # Pre-load VAD model BEFORE audio feedback
-        # This ensures recording is truly ready when user hears Ping
-        if use_vad:
-            from vad_record import get_vad_model
-            if args.debug:
-                print("Pre-loading VAD model...")
-            get_vad_model()  # Loads and caches the model
-            if args.debug:
-                print("VAD model ready")
-
-        # Visual feedback: recording started
-        if show_notify:
-            if use_vad:
-                notify("Voice CLI", "Recording... (auto-stops when you pause)")
-            else:
-                notify("Voice CLI", f"Recording for {duration}s... Speak now!")
-
-        # Audio feedback: recording started (model is now ready!)
-        if use_sound:
-            play_sound("Ping")
-
-        # Show visual recording indicator
-        indicator = None
-        if show_indicator:
-            indicator = show_recording_indicator()
-
-        # Create audio level callback for waveform visualization
-        def on_audio_level(level):
-            if indicator:
-                indicator.update_level(level)
-
-        # Record audio - VAD by default (auto-stops when you stop speaking)
-        try:
-            if use_vad:
-                try:
-                    audio_path = record_with_vad(
-                        silence_duration=silence_duration,
-                        max_duration=max_duration,
-                        speech_threshold=vad_threshold,
-                        on_audio_level=on_audio_level if show_indicator else None,
-                    )
-                except Exception as e:
-                    # Fallback to fixed duration if VAD fails
-                    if args.debug:
-                        print(f"VAD failed, using fixed duration: {e}")
-                    audio_path = record_fixed_duration(duration=duration)
-            else:
-                audio_path = record_fixed_duration(duration=duration)
-        finally:
-            # Hide indicator when recording stops
-            if indicator:
-                hide_recording_indicator(indicator)
-
-        # Audio feedback: recording stopped, processing
-        if use_sound:
-            play_sound("Pop")
-
-        # Check if audio file was created and has content
-        if not os.path.exists(audio_path):
-            if show_notify:
-                notify("Voice CLI", "No audio file created")
-            if args.debug:
-                print("No audio recorded")
-            return
-
-        file_size = os.path.getsize(audio_path)
-        if file_size < 1000:  # Less than 1KB, probably no speech
-            if show_notify:
-                notify("Voice CLI", f"No speech detected ({file_size} bytes)")
-            if args.debug:
-                print(f"Audio file too small ({file_size} bytes), no speech detected")
-            os.remove(audio_path)
-            return
-
-        # Visual feedback: transcribing
-        if show_notify:
-            mode_name = {"mlx": "MLX", "groq": "Groq", "local": "Local"}
-            notify("Voice CLI", f"Transcribing ({mode_name.get(transcription_mode, transcription_mode)})...")
-
-        # Transcribe using selected mode
-        if args.debug:
-            print(f"Transcription mode: {transcription_mode}")
-
-        if transcription_mode == "mlx":
-            # Fast local transcription using Lightning Whisper MLX (Apple Silicon)
-            try:
-                from mlx_transcribe import transcribe_with_mlx
-                text = transcribe_with_mlx(audio_path, model_name=model)
-            except ImportError:
-                if args.debug:
-                    print("MLX not available, falling back to local")
-                text = Transcriber.transcribe(audio_path, model_name=model)
-            except Exception as e:
-                if args.debug:
-                    print(f"MLX failed: {e}, falling back to local")
-                text = Transcriber.transcribe(audio_path, model_name=model)
-
-        elif transcription_mode == "groq":
-            # Cloud transcription using Groq API (fastest, requires API key)
-            if not groq_api_key:
-                if show_notify:
-                    notify("Voice CLI Error", "Groq API key required. Set GROQ_API_KEY or use --mode mlx")
-                if args.debug:
-                    print("Groq API key not set")
-                os.remove(audio_path)
-                return
-            try:
-                from groq_transcribe import transcribe_with_groq
-                text = transcribe_with_groq(audio_path, api_key=groq_api_key)
-            except Exception as e:
-                if args.debug:
-                    print(f"Groq failed: {e}, falling back to local")
-                text = Transcriber.transcribe(audio_path, model_name=model)
-
-        else:
-            # Local fallback using faster-whisper (slower but reliable)
-            text = Transcriber.transcribe(audio_path, model_name=model)
-
-        if not text:
-            if show_notify:
-                notify("Voice CLI", "No text transcribed")
-            if args.debug:
-                print("No text transcribed")
-            os.remove(audio_path)
-            return
-
-        # Convert number words to digits
-        if convert_nums:
-            text = convert_number_words(text)
-
-        # Check for LLM refinement trigger (e.g., "for claude code")
-        llm_mode = None
-        if use_llm:
-            text, llm_mode = check_llm_trigger(text, llm_triggers)
-            if llm_mode:
-                if args.debug:
-                    print(f"LLM trigger detected: {llm_mode}")
-                    print(f"Original text: {text}")
-                if show_notify:
-                    notify("Voice CLI", f"Refining for {llm_mode}...")
-                text = refine_text(text, llm_mode, config)
-                if args.debug:
-                    print(f"Refined text: {text}")
-
-        # Check for enter trigger words (e.g., "send", "enter")
-        should_enter = False
-        if auto_enter:
-            text, should_enter = check_enter_trigger(text, enter_triggers)
-
-        if args.debug:
-            print(f"Transcribed: {text}")
-            print(f"Mode: {transcription_mode}")
-            print(f"Model: {model}")
-            print(f"Audio size: {file_size} bytes")
-            print(f"Target app: {original_app}")
-            print(f"Should enter: {should_enter}")
-            if show_notify:
-                notify("Voice CLI", f"Done: {text[:50]}...")
-        else:
-            # Type the result into the original app using clipboard method
-            # This is more reliable when triggered from Raycast
-            if text:  # Only paste if there's text after removing trigger
-                type_text_via_clipboard(text, target_app=original_app)
-
-            # Press Enter if trigger word was detected
-            if should_enter:
-                import time
-                time.sleep(0.05)  # Small delay to ensure paste completes
-                press_enter()
-
-            if show_notify:
-                action = "Sent" if should_enter else "Typed"
-                notify("Voice CLI", f"{action}: {text[:50]}...")
-
-        # Cleanup
-        os.remove(audio_path)
-
+        run_voice_session(config, stop_requested, debug=args.debug)
     except KeyboardInterrupt:
-        if args.debug:
-            print("\nCancelled")
+        log_info("cancelled (KeyboardInterrupt)")
         sys.exit(0)
     except FileNotFoundError as e:
-        if show_notify:
+        if config.get("show_notifications", True):
+            from output import notify
             notify("Voice CLI Error", str(e))
+        log_error(f"FileNotFoundError: {e}")
         print(f"Error: {e}", file=sys.stderr)
-        print("Make sure sox is installed: brew install sox", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
-        if show_notify:
+        if config.get("show_notifications", True):
+            from output import notify
             notify("Voice CLI Error", str(e)[:100])
+        log_error(f"unhandled exception: {e}")
         print(f"Error: {e}", file=sys.stderr)
         if args.debug:
             import traceback
             traceback.print_exc()
         sys.exit(1)
     finally:
-        # Always release the lock when done
-        release_lock(lock_fd)
+        remove_pidfile()
 
 
 if __name__ == "__main__":

@@ -34,9 +34,16 @@ No test suite exists yet.
 ## Architecture
 
 ```
-Raycast hotkey → voice-toggle.sh → bin/voice-cli
-                                        ↓
-                              vad_record.py (Silero VAD)
+Raycast hotkey → voice-toggle.sh → bin/voice-cli-client
+                                        │
+                  ┌─────────────────────┴──────────────────────┐
+                  │ fast path                  fallback path   │
+                  ▼                                            ▼
+       Unix socket → src/daemon.py        bin/voice-cli (standalone)
+                  │                                            │
+                  └──────────── src/session.py ────────────────┘
+                                        │
+                              src/vad_record.py (Silero VAD)
                                         ↓
                     ┌───────────────────┼───────────────────┐
                     ↓                   ↓                   ↓
@@ -50,6 +57,20 @@ Raycast hotkey → voice-toggle.sh → bin/voice-cli
                                         ↓
                               output.py (clipboard + osascript paste)
 ```
+
+**Daemon mode (default since 2026-05-23):** `bin/voice-cli-client` is what
+the hotkey actually runs. It sends `{"op":"toggle"}` to `src/daemon.py`
+over the Unix socket at `~/.voice-cli/voice-cli.sock`. The daemon keeps
+the VAD + MLX models preloaded in RAM (~250MB), so toggle round-trip is
+~1ms vs ~1.5s for a cold `bin/voice-cli` invocation.
+
+If the daemon isn't running (e.g. first press of a session, crash), the
+client spawns it in the background and falls back to `bin/voice-cli` for
+that one press. The next press hits the now-warm daemon.
+
+To restart the daemon: `pkill -f "python -m daemon"`; next hotkey press
+will respawn it. To stop it without restart: send `{"op":"shutdown"}` over
+the socket.
 
 ### Transcription Backends
 

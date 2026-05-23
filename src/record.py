@@ -1,10 +1,12 @@
 """
-Audio recording module using sox with silence detection.
+Fixed-duration audio recorder using sox.
+
+Used only as a fallback when VAD recording fails or is explicitly disabled
+via --no-vad. The primary recorder is src/vad_record.py.
 """
 
 import subprocess
 import os
-import tempfile
 from pathlib import Path
 
 
@@ -13,91 +15,6 @@ def get_recording_path():
     config_dir = Path.home() / ".voice-cli"
     config_dir.mkdir(exist_ok=True)
     return str(config_dir / "recording.wav")
-
-
-def record_with_silence_detection(
-    output_path=None,
-    silence_duration=2.0,
-    threshold="1%",
-    sample_rate=16000,
-    max_duration=30,
-    start_immediately=True
-):
-    """
-    Record audio from the default microphone until silence is detected.
-
-    Starts recording immediately and stops after silence_duration seconds
-    of audio below threshold.
-
-    Typical values:
-    - Background noise: < 1% of max sample value
-    - Speech: ~4% of max sample value
-    - Threshold of 1% works well for most environments
-
-    Args:
-        output_path: Where to save the audio. Defaults to ~/.voice-cli/recording.wav
-        silence_duration: Seconds of silence before stopping (default: 2.0)
-        threshold: Silence threshold in dB (default: "-50d") or percentage (e.g., "1%")
-        sample_rate: Audio sample rate in Hz (default: 16000, optimal for Whisper)
-        max_duration: Maximum recording time in seconds (default: 30)
-        start_immediately: If True, start recording immediately without waiting for speech
-
-    Returns:
-        Path to the recorded audio file
-
-    Raises:
-        subprocess.CalledProcessError: If sox fails
-        FileNotFoundError: If sox is not installed
-    """
-    if output_path is None:
-        output_path = get_recording_path()
-
-    # Ensure parent directory exists
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    # Remove existing file if present
-    if os.path.exists(output_path):
-        os.remove(output_path)
-
-    # sox command for macOS with silence detection
-    # -d: Use default audio input device
-    # -c 1: Mono channel
-    # -r 16000: 16kHz sample rate (optimal for Whisper)
-    #
-    # Silence detection approach:
-    # - "silence 0": Don't skip leading silence, start recording immediately
-    # - "1 duration threshold": Stop after duration seconds below threshold
-    # - trim 0 max: Safety cap to prevent hanging
-    #
-    # Using 1% threshold because typical speech peaks at ~4% and background at <1%
-    cmd = [
-        "sox",
-        "-d",                              # Default audio device (microphone)
-        "-c", "1",                         # Mono
-        "-r", str(sample_rate),            # Sample rate
-        output_path,                       # Output file
-        "silence",
-        "0",                               # Don't remove leading silence (start immediately)
-        "1", str(silence_duration), threshold,  # Stop after silence_duration below threshold
-        "trim", "0", str(max_duration),    # Safety cap at max_duration
-    ]
-
-    try:
-        # Use timeout to prevent hanging forever
-        subprocess.run(cmd, check=True, capture_output=True, timeout=max_duration + 5)
-    except subprocess.TimeoutExpired:
-        # Recording timed out - file should still exist
-        pass
-    except FileNotFoundError:
-        raise FileNotFoundError(
-            "sox is not installed. Run: brew install sox"
-        )
-    except subprocess.CalledProcessError as e:
-        # sox returns non-zero if interrupted, which is fine
-        if not os.path.exists(output_path):
-            raise
-
-    return output_path
 
 
 def record_fixed_duration(output_path=None, duration=5.0, sample_rate=16000):
@@ -126,7 +43,7 @@ def record_fixed_duration(output_path=None, duration=5.0, sample_rate=16000):
         "-c", "1",
         "-r", str(sample_rate),
         output_path,
-        "trim", "0", str(duration)
+        "trim", "0", str(duration),
     ]
 
     subprocess.run(cmd, check=True, capture_output=True)
