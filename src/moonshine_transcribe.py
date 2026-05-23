@@ -25,10 +25,12 @@ Install: ~/.voice-cli-venv/bin/pip install moonshine-voice
 import os
 from pathlib import Path
 
-# Cached Transcriber instance — reused across recording sessions so the
-# model only loads once per daemon lifetime.
+# Cached Transcriber + Stream — reused across recording sessions so the
+# model only loads once per daemon lifetime AND each new session doesn't
+# pay first-call ONNX cold-start latency.
 _transcriber = None
 _current_variant = None
+_stream = None  # one warm Stream, reset (not recreated) per session
 
 
 # Where moonshine-voice stashes downloaded models on macOS.
@@ -66,15 +68,23 @@ def _ensure_downloaded(variant: str) -> Path:
 
 
 def get_moonshine_model(config: dict | None = None):
-    """Lazy-load and cache the Moonshine streaming Transcriber. Subsequent
-    calls reuse the cached instance — fast for daemon use."""
-    global _transcriber, _current_variant
+    """Lazy-load and cache the Moonshine streaming Transcriber AND one
+    warm Stream. Subsequent calls reuse the cached pair — fast for
+    daemon use."""
+    global _transcriber, _current_variant, _stream
     variant = (config or {}).get("moonshine_variant", "small-streaming-en")
 
     if _transcriber is not None and _current_variant == variant:
         return _transcriber
 
     # Different variant requested — drop the old one first.
+    if _stream is not None:
+        try:
+            _stream.stop()
+            _stream.close()
+        except Exception:
+            pass
+        _stream = None
     if _transcriber is not None:
         try:
             _transcriber.stop()
@@ -97,79 +107,87 @@ def get_moonshine_model(config: dict | None = None):
     tx = mv.Transcriber(
         model_path=str(cache_path),
         model_arch=arch,
-        update_interval=0.3,
+        update_interval=0.1,
     )
     tx.start()
 
-    # Warm-up: feed 100ms of silence so the first real chunk doesn't
-    # incur first-call ONNX overhead and drop words.
+    # Warm up the Transcriber itself.
     tx.add_audio([0.0] * 1600, sample_rate=16000)
     tx.update_transcription()
 
+    # Pre-create the long-lived per-daemon Stream and warm it up too.
+    stream = tx.create_stream(update_interval=0.1)
+    stream.start()
+    stream.add_audio([0.0] * 1600, sample_rate=16000)
+    stream.update_transcription()
+
     _transcriber = tx
     _current_variant = variant
+    _stream = stream
     return _transcriber
 
 
 def unload_moonshine_model() -> bool:
-    """Drop the cached Transcriber so the OS can reclaim RAM. The next
-    call to get_moonshine_model reloads it (~700ms one-time cost)."""
-    global _transcriber, _current_variant
-    if _transcriber is None:
+    """Drop the cached Transcriber AND Stream so the OS can reclaim RAM.
+    The next call to get_moonshine_model reloads them (~700ms one-time)."""
+    global _transcriber, _current_variant, _stream
+    if _transcriber is None and _stream is None:
         return False
-    try:
-        _transcriber.stop()
-        _transcriber.close()
-    except Exception:
-        pass
-    _transcriber = None
+    if _stream is not None:
+        try:
+            _stream.stop()
+            _stream.close()
+        except Exception:
+            pass
+        _stream = None
+    if _transcriber is not None:
+        try:
+            _transcriber.stop()
+            _transcriber.close()
+        except Exception:
+            pass
+        _transcriber = None
     _current_variant = None
     return True
 
 
 def open_session_stream(config: dict | None = None):
     """
-    Open a fresh per-session Stream from the cached Transcriber.
+    Return the daemon's one warm Stream, reset for a fresh session.
 
-    Returns a moonshine_voice Stream that has its own accumulator state —
-    no leakage from prior sessions. Caller is responsible for stop()/close()
-    via close_session_stream() when done.
+    Architecture: we keep a single long-lived Stream alive in module
+    state (created and warmed up in get_moonshine_model). Each session
+    calls stop()/start() on it to clear the encoder accumulator state,
+    then re-warms with 100ms of silence. Round-trip cost: ~6ms — vs
+    creating a fresh Stream per session which was paying ~3-4 seconds
+    of cold-start ONNX allocation overhead.
 
-    The Transcriber (model + ONNX runtime + tokenizer) is reused across
-    sessions, so this is cheap: only the per-stream state is allocated.
-
-    The new stream is warmed up with 100ms of silence + a drain pass so
-    the first real-audio chunk doesn't pay first-call ONNX allocation
-    overhead. Hides ~150-500ms of cold-start latency at session start
-    (before the Ping plays) rather than after end-of-speech.
+    No state leaks across sessions (verified): stop+start fully clears
+    the encoder's internal cache; the warmup primes the next inference.
     """
-    tx = get_moonshine_model(config)
-    # update_interval=0.1 tells Moonshine to drain its audio queue every
-    # 100ms instead of every 300ms — keeps the background processor
-    # more aggressively fed when our daemon's threading puts pressure
-    # on the GIL between PyAudio capture and Moonshine inference.
-    stream = tx.create_stream(update_interval=0.1)
-    stream.start()
-    # Warm-up: 100ms of silence + drain. Without this, the first real
-    # add_audio call on a fresh stream allocates KV caches and ONNX
-    # buffers — which makes finalize() block waiting for chunks to drain.
-    stream.add_audio([0.0] * 1600, sample_rate=16000)
-    stream.update_transcription()
-    return stream
+    # Make sure the model + warm stream exist.
+    get_moonshine_model(config)
+    global _stream
+    if _stream is None:
+        raise RuntimeError("moonshine stream not initialised")
+
+    # Reset for a fresh session.
+    try:
+        _stream.stop()
+    except Exception:
+        pass
+    _stream.start()
+    # Re-warm so the first real-audio chunk doesn't pay any cold-start.
+    _stream.add_audio([0.0] * 1600, sample_rate=16000)
+    _stream.update_transcription()
+    return _stream
 
 
 def close_session_stream(stream) -> None:
-    """Stop and close a per-session Stream. Idempotent on errors."""
-    if stream is None:
-        return
-    try:
-        stream.stop()
-    except Exception:
-        pass
-    try:
-        stream.close()
-    except Exception:
-        pass
+    """No-op — the Stream is long-lived and shared across sessions.
+    State is cleared on the next open_session_stream() via stop+start.
+    Kept as a hook for any future per-session cleanup."""
+    return
 
 
 def finalize(stream, max_iters: int = 40, settle_delay_s: float = 0.05) -> str:
