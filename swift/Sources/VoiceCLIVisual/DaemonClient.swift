@@ -54,10 +54,14 @@ final class DaemonClient: @unchecked Sendable {
             guard let self else { return }
             switch state {
             case .ready:
-                self.reconnectDelay = 0.5
+                NSLog("VoiceCLIVisual: connected to daemon")
+                self.reconnectDelay = 0.3
                 self.sendSubscribe()
                 self.receiveLoop()
-            case .failed, .cancelled:
+            case .failed(let err):
+                NSLog("VoiceCLIVisual: connection failed: \(err)")
+                self.scheduleReconnect()
+            case .cancelled:
                 self.scheduleReconnect()
             default:
                 break
@@ -70,7 +74,11 @@ final class DaemonClient: @unchecked Sendable {
         connection?.cancel()
         connection = nil
         let delay = reconnectDelay
-        reconnectDelay = min(reconnectDelay * 1.7, 10.0)
+        // Cap at 3 seconds (was 10). When the user `pkill`s the daemon
+        // or upgrades it, we want to rejoin in at most a few seconds —
+        // long enough not to thrash, short enough that the next hotkey
+        // press always finds a subscribed HUD.
+        reconnectDelay = min(reconnectDelay * 1.5, 3.0)
         queue.asyncAfter(deadline: .now() + delay) { [weak self] in
             self?.connect()
         }
