@@ -18,6 +18,13 @@ let package = Package(
             path: "Sources/VoiceCLIVisual",
             swiftSettings: [
                 .swiftLanguageMode(.v5),
+            ],
+            linkerSettings: [
+                // Carbon framework is needed for RegisterEventHotKey.
+                // It's a legacy framework but still ships with macOS 26
+                // and is the standard way native apps register global
+                // hotkeys without needing Accessibility permission.
+                .linkedFramework("Carbon"),
             ]
         ),
     ]

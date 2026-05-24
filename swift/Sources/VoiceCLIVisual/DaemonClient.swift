@@ -45,6 +45,36 @@ final class DaemonClient: @unchecked Sendable {
         connect()
     }
 
+    /// Open a transient connection, send {"op":"toggle"}, close. Used by
+    /// the global hotkey to trigger a recording session — independent of
+    /// the persistent subscribe connection so reading/writing don't race.
+    func sendToggle() {
+        sendOneShot(opPayload: Data("{\"op\":\"toggle\"}\n".utf8))
+    }
+
+    private func sendOneShot(opPayload: Data) {
+        let endpoint = NWEndpoint.unix(path: socketPath)
+        let conn = NWConnection(to: endpoint, using: .tcp)
+        conn.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                conn.send(content: opPayload, completion: .contentProcessed { _ in
+                    // Read one reply line then close — the daemon ack
+                    // tells us the toggle landed; subscription receives
+                    // the actual event stream separately.
+                    conn.receive(minimumIncompleteLength: 1, maximumLength: 4096) { _, _, _, _ in
+                        conn.cancel()
+                    }
+                })
+            case .failed, .cancelled:
+                conn.cancel()
+            default:
+                break
+            }
+        }
+        conn.start(queue: queue)
+    }
+
     private func connect() {
         let endpoint = NWEndpoint.unix(path: socketPath)
         let conn = NWConnection(to: endpoint, using: .tcp)
