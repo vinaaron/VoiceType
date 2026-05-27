@@ -112,7 +112,7 @@ def load_config():
 
     defaults = {
         "model": "distil-medium.en",
-        "transcription_mode": "mlx",
+        "transcription_mode": "moonshine",
         "groq_api_key": None,
         "silence_duration": 1.2,
         "silence_threshold": "1%",
@@ -159,7 +159,7 @@ def main():
     parser.add_argument("--no-sound", action="store_true")
     parser.add_argument("--no-numbers", action="store_true")
     parser.add_argument("--model", default=None)
-    parser.add_argument("--mode", default=None, choices=["mlx", "groq", "local"])
+    parser.add_argument("--mode", default=None, choices=["moonshine", "parakeet", "groq", "local"])
     parser.add_argument("--duration", type=float, default=5.0)
     parser.add_argument("--no-vad", action="store_true")
     parser.add_argument("--silence", type=float, default=None)

@@ -1,23 +1,33 @@
-# Voice CLI Dependencies
+# Voice CLI Python Dependencies
+#
+# All version pins are exact-or-newer (>=) to give pip room for security
+# patches while keeping the minimum spec well-known. The Swift app's
+# dependencies live in swift/Package.resolved.
 
 # Environment variable loading from .env files
 python-dotenv>=1.0.0
 
-# PyObjC for native macOS floating window indicator
+# PyObjC for any native macOS interop on the Python side
 pyobjc-core>=10.0
 pyobjc-framework-Cocoa>=10.0
 
-# Fast local transcription for Apple Silicon (10x faster than Whisper CPP)
-lightning-whisper-mlx>=0.4.0
+# Primary transcription backend — streaming, sub-second latency on Apple Silicon
+moonshine-voice>=0.0.59
 
-# Fallback transcription (CPU-based, works on all platforms)
+# Reliable CPU fallback when Moonshine isn't available (and the only
+# transcriber that works on non-Apple-Silicon machines)
 faster-whisper>=1.0.0
 
-# Optional: Cloud transcription (299x real-time speed)
+# Optional: cloud transcription via Groq's whisper-large-v3 endpoint
+# (used when transcription_mode=groq is set)
 groq>=0.11.0
 
-# Voice Activity Detection (intelligent silence detection)
+# Voice Activity Detection — gates the start/stop of every recording
 silero-vad>=5.0
 
 # Real-time microphone access (requires portaudio: brew install portaudio)
 PyAudio>=0.2.14
+
+# Optional: NVIDIA Parakeet V3 backend (English-only, comparable to Whisper).
+# Not pulled in by default — install with: pip install parakeet-mlx
+# Then set transcription_mode: parakeet in config.yaml.

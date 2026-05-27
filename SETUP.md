@@ -31,7 +31,7 @@ What `setup.sh` does, in order:
 1. Installs `sox` and `portaudio` (audio capture) via Homebrew
 2. Creates a Python venv at `~/.voice-cli-venv`
 3. Installs requirements: `silero-vad`, `faster-whisper`, `pyaudio`,
-   `lightning-whisper-mlx`, `moonshine-voice`, plus deps
+   `moonshine-voice` (primary, streaming), plus deps
 4. Pre-downloads Whisper base.en + Silero VAD model weights (~50 MB)
 5. Creates default config at `~/.voice-cli/config.yaml`
 6. Marks `bin/voice-cli` executable

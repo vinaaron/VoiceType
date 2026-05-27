@@ -109,7 +109,7 @@ def run_voice_session(
         {"ok": False, "reason": "..."} on early exit (no speech, etc.)
     """
     model = config["model"]
-    transcription_mode = config.get("transcription_mode", "mlx")
+    transcription_mode = config.get("transcription_mode", "moonshine")
     groq_api_key = config.get("groq_api_key") or os.environ.get("GROQ_API_KEY")
     duration = config.get("duration", 5.0)
     silence_duration = config["silence_duration"]
@@ -235,10 +235,10 @@ def run_voice_session(
                 "target_app": original_app,
             }
         except ImportError as e:
-            log_error(f"moonshine not available ({e}), falling back to batch MLX")
+            log_error(f"moonshine not available ({e}), falling back to CPU faster-whisper")
             _publish({"event": "session_failed", "reason": "moonshine_unavailable"})
         except Exception as e:
-            log_error(f"moonshine streaming failed: {e}, falling back to batch MLX")
+            log_error(f"moonshine streaming failed: {e}, falling back to CPU faster-whisper")
             _publish({"event": "session_failed", "reason": str(e)[:120]})
             import traceback
             traceback.print_exc()
@@ -285,7 +285,7 @@ def run_voice_session(
         return {"ok": False, "reason": "no_speech"}
 
     if show_notify:
-        mode_name = {"mlx": "MLX", "groq": "Groq", "local": "Local"}
+        mode_name = {"moonshine": "Moonshine", "parakeet": "Parakeet", "groq": "Groq", "local": "Local"}
         notify("Voice CLI", f"Transcribing ({mode_name.get(transcription_mode, transcription_mode)})...")
 
     log_info(f"transcribing mode={transcription_mode}")
@@ -300,24 +300,11 @@ def run_voice_session(
             from parakeet_transcribe import transcribe_with_parakeet
             text = transcribe_with_parakeet(audio_path, model_name=parakeet_model)
         except ImportError as e:
-            log_error(f"parakeet-mlx not installed ({e}), falling back to MLX Whisper")
-            from mlx_transcribe import transcribe_with_mlx
-            text = transcribe_with_mlx(audio_path, model_name=model, initial_prompt=initial_prompt)
-        except Exception as e:
-            log_error(f"Parakeet failed: {e}, falling back to MLX Whisper")
-            from mlx_transcribe import transcribe_with_mlx
-            text = transcribe_with_mlx(audio_path, model_name=model, initial_prompt=initial_prompt)
-
-    elif transcription_mode == "mlx":
-        try:
-            from mlx_transcribe import transcribe_with_mlx
-            text = transcribe_with_mlx(audio_path, model_name=model, initial_prompt=initial_prompt)
-        except ImportError:
-            log_info("MLX not available, falling back to local")
+            log_error(f"parakeet-mlx not installed ({e}), falling back to faster-whisper (CPU)")
             from transcribe import Transcriber
             text = Transcriber.transcribe(audio_path, model_name=model)
         except Exception as e:
-            log_error(f"MLX failed: {e}, falling back to local")
+            log_error(f"Parakeet failed: {e}, falling back to faster-whisper (CPU)")
             from transcribe import Transcriber
             text = Transcriber.transcribe(audio_path, model_name=model)
 

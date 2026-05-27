@@ -47,8 +47,9 @@ Raycast hotkey → voice-toggle.sh → bin/voice-cli-client
                                         ↓
                     ┌───────────────────┼───────────────────┐
                     ↓                   ↓                   ↓
-            mlx_transcribe.py   transcribe.py      groq_transcribe.py
-            (MLX - fastest)     (faster-whisper)   (Groq cloud API)
+        moonshine_transcribe.py  transcribe.py    groq_transcribe.py
+        (Moonshine streaming —   (faster-whisper  (Groq cloud API,
+         default & primary)       CPU fallback)    transcription_mode=groq)
                     └───────────────────┼───────────────────┘
                                         ↓
                               llm_refine.py (optional, trigger-based)
@@ -57,6 +58,10 @@ Raycast hotkey → voice-toggle.sh → bin/voice-cli-client
                                         ↓
                               output.py (clipboard + osascript paste)
 ```
+
+Optional 4th backend: `parakeet_transcribe.py` (NVIDIA Parakeet V3 via
+`parakeet-mlx`). Not installed by default; opt-in by setting
+`transcription_mode: parakeet` and `pip install parakeet-mlx`.
 
 **Daemon mode (default since 2026-05-23):** `bin/voice-cli-client` is what
 the hotkey actually runs. It sends `{"op":"toggle"}` to `src/daemon.py`
@@ -173,7 +178,7 @@ User config: `~/.voice-cli/config.yaml`
 Key settings:
 ```yaml
 # Transcription mode: mlx (fastest), groq (cloud), local (fallback)
-transcription_mode: mlx
+transcription_mode: moonshine
 
 # MLX/local models: distil-small.en (fastest), distil-medium.en (balanced)
 model: distil-medium.en

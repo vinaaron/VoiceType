@@ -126,7 +126,7 @@ def load_config() -> dict:
 
     defaults = {
         "model": "distil-medium.en",
-        "transcription_mode": "mlx",
+        "transcription_mode": "moonshine",
         "groq_api_key": None,
         "silence_duration": 1.2,
         "silence_threshold": "1%",
@@ -196,33 +196,11 @@ def preload_models(config: dict) -> None:
             log_error(f"Parakeet preload failed: {e}")
         return  # don't also preload Whisper if Parakeet is the chosen mode
 
-    # Pre-load MLX too if that's the transcription mode. This costs ~250MB
-    # of RAM idle but makes transcription effectively instant.
-    if mode == "mlx":
-        try:
-            from mlx_transcribe import transcribe_with_mlx  # noqa: F401
-            # The module-level cache in mlx_transcribe loads on first call,
-            # not on import. We trigger it by transcribing a tiny dummy clip.
-            import tempfile, wave, struct
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp_path = tmp.name
-            with wave.open(tmp_path, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(16000)
-                wf.writeframes(struct.pack("<" + "h" * 1600, *([0] * 1600)))  # 0.1s silence
-            try:
-                transcribe_with_mlx(tmp_path, model_name=config["model"])
-            except Exception as e:
-                log_info(f"MLX warmup skipped: {e}")
-            finally:
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
-            log_stage("daemon_mlx_ready")
-        except ImportError:
-            log_info("MLX not installed; transcription will cold-start on first use")
+    # No additional preload for other modes — groq is cloud (zero local
+    # warm-up), local uses faster-whisper which loads lazily, and the
+    # MLX backend was removed (lightning-whisper-mlx had yellow-flag
+    # trust posture; Moonshine handles the streaming case and
+    # faster-whisper is the reliable CPU fallback).
 
 
 def _last_transcript_entry() -> dict | None:
@@ -395,12 +373,6 @@ def idle_reaper(timeout_seconds: float) -> None:
             if _current_session is not None and _current_session.alive():
                 continue  # active recording — don't yank the model out
         try:
-            from mlx_transcribe import unload_mlx_model
-            mlx_dropped = unload_mlx_model()
-        except Exception as e:
-            log_error(f"idle reaper MLX unload failed: {e}")
-            mlx_dropped = False
-        try:
             from parakeet_transcribe import unload_parakeet_model
             parakeet_dropped = unload_parakeet_model()
         except Exception:
@@ -410,10 +382,10 @@ def idle_reaper(timeout_seconds: float) -> None:
             moonshine_dropped = unload_moonshine_model()
         except Exception:
             moonshine_dropped = False
-        if mlx_dropped or parakeet_dropped or moonshine_dropped:
+        if parakeet_dropped or moonshine_dropped:
             log_info(
                 f"idle {int(idle)}s ≥ {int(timeout_seconds)}s — "
-                f"models unloaded (mlx={mlx_dropped}, parakeet={parakeet_dropped}, moonshine={moonshine_dropped})"
+                f"models unloaded (parakeet={parakeet_dropped}, moonshine={moonshine_dropped})"
             )
 
 
