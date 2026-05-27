@@ -12,9 +12,18 @@ let package = Package(
     products: [
         .executable(name: "VoiceCLIVisual", targets: ["VoiceCLIVisual"]),
     ],
+    dependencies: [
+        // Yams: parses ~/.voice-cli/config.yaml's swift_hotkey block so the
+        // user can rebind without rebuilding. Stable, well-maintained YAML
+        // library that's the de-facto standard for Swift.
+        .package(url: "https://github.com/jpsim/Yams.git", from: "5.0.0"),
+    ],
     targets: [
         .executableTarget(
             name: "VoiceCLIVisual",
+            dependencies: [
+                .product(name: "Yams", package: "Yams"),
+            ],
             path: "Sources/VoiceCLIVisual",
             swiftSettings: [
                 .swiftLanguageMode(.v5),

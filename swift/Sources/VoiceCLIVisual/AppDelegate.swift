@@ -10,6 +10,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var client: DaemonClient!
     private var hotkey: HotKey!
     private var statusItem: NSStatusItem!
+    private var resolvedHotkey: HotkeyConfig.Resolved!
     private let viewModel = HUDViewModel()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -36,16 +37,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // stays alive.)
         DaemonLauncher.ensureRunning()
 
-        // Register Ctrl+Opt+V as our global hotkey.
-        hotkey = HotKey(keyCode: UInt32(kVK_ANSI_V), modifiers: [.control, .option])
+        // Resolve the hotkey from ~/.voice-cli/config.yaml (falls back
+        // to ⌃⌥V if unset). To change, edit `swift_hotkey:` in that file
+        // and restart this app — no rebuild needed.
+        let resolved = HotkeyConfig.load()
+        hotkey = HotKey(keyCode: resolved.keyCode, modifiers: resolved.modifiers)
         hotkey.onPressed = { [weak self] in
             self?.handleHotkey()
         }
         if !hotkey.register() {
-            NSLog("VoiceCLIVisual: failed to register Ctrl+Opt+V hotkey")
+            NSLog("VoiceCLIVisual: failed to register hotkey \(resolved.display)")
         } else {
-            NSLog("VoiceCLIVisual: Ctrl+Opt+V registered")
+            NSLog("VoiceCLIVisual: \(resolved.display) registered")
         }
+        self.resolvedHotkey = resolved
 
         // Menu bar status item — gives a way to quit, toggle login item,
         // and verify the app is running. Since LSUIElement=true we have
@@ -63,12 +68,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func installStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        let label = resolvedHotkey?.display ?? "⌃⌥V"
         if let button = statusItem.button {
             button.title = "🎤"
-            button.toolTip = "VoiceCLI — Ctrl+Opt+V to dictate"
+            button.toolTip = "VoiceCLI — \(label) to dictate"
         }
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Voice CLI is listening for ⌃⌥V",
+        menu.addItem(NSMenuItem(title: "Voice CLI is listening for \(label)",
                                 action: nil, keyEquivalent: ""))
         menu.addItem(.separator())
         let loginItem = NSMenuItem(title: "Open at Login",

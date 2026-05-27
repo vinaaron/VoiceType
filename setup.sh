@@ -120,27 +120,29 @@ EOF
     echo "Created default config at $CONFIG_DIR/config.yaml"
 fi
 
-# Setup Raycast script
-echo "[7/7] Setting up Raycast integration..."
-mkdir -p "$RAYCAST_DIR"
-cp "$SCRIPT_DIR/raycast/voice-toggle.sh" "$RAYCAST_DIR/"
-chmod +x "$RAYCAST_DIR/voice-toggle.sh"
-
-# Make bin executable
+# Make bin executable (used as the standalone fallback)
 chmod +x "$SCRIPT_DIR/bin/voice-cli"
+
+# Build and install the native Swift app (handles the hotkey + HUD)
+echo "[7/7] Building VoiceCLIVisual.app..."
+if command -v swift &> /dev/null; then
+    "$SCRIPT_DIR/swift/make_app.sh"
+else
+    echo "Swift not found — install Xcode or the Command Line Tools to build the HUD app."
+    echo "Without it you can still run \`bin/voice-cli\` manually, but no hotkey or HUD."
+fi
 
 echo ""
 echo "=== Setup Complete! ==="
 echo ""
 echo "Next steps:"
-echo "1. Open Raycast Settings (Cmd+,)"
-echo "2. Go to Extensions > Script Commands"
-echo "3. Click 'Add Directories' and add: $RAYCAST_DIR"
-echo "4. Search for 'Reload Script Directories' in Raycast and run it"
-echo "5. Find 'Voice Toggle' in Extensions and assign hotkey: Control+Option+V"
+echo "1. Look for the 🎤 icon in your menu bar (VoiceCLIVisual.app)"
+echo "2. Press ⌃⌥V (Control+Option+V) to start a recording"
+echo "3. When prompted, grant Microphone and Accessibility permissions to VoiceCLIVisual"
+echo "4. Click 🎤 → 'Open at Login' to auto-start the app on next reboot"
 echo ""
-echo "Required Permissions:"
-echo "- Microphone: System Settings > Privacy & Security > Microphone > Enable for your terminal"
-echo "- Accessibility: System Settings > Privacy & Security > Accessibility > Enable for your terminal"
+echo "To change the hotkey:"
+echo "  Edit \$HOME/.voice-cli/config.yaml, swift_hotkey block. Restart the app."
 echo ""
-echo "Test by running: $SCRIPT_DIR/bin/voice-cli"
+echo "To test transcription without the hotkey:"
+echo "  ~/.voice-cli-venv/bin/python $SCRIPT_DIR/bin/voice-cli --debug"
